@@ -103,6 +103,10 @@ typedef enum {
  */
 FuriHalNfcError furi_hal_nfc_init(void);
 
+/** Put the reader IC in its lowest-power state if no NFC session owns it
+ * (PN532: PowerDown). It wakes up automatically on the next command. */
+void furi_hal_nfc_power_down(void);
+
 /**
  * @brief Check whether the NFC HAL was properly initialised and is ready.
  *

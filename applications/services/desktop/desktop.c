@@ -25,11 +25,115 @@
 
 #include "furi_hal_power.h"
 
+#include <btshim.h>
+#include <wifi.h>
+
 #define TAG "Desktop"
 /* Verzoegerung fuer den qFlipper-Bridge-Resume nach einem OTA-Reboot. */
 #define QFLIPPER_RESUME_DELAY_MS 5000
 /* Poll-Intervall fuer das "qflipper"-Kommando auf der USJ-Konsole. */
 #define QFLIPPER_USJ_POLL_MS 100
+
+static int32_t desktop_system_task_worker(void* context) {
+    Desktop* desktop = context;
+    const uint32_t started_at = furi_get_tick();
+    const char* task_name = "unknown";
+    bool success = true;
+
+    switch(desktop->system_task) {
+    case DesktopSystemTaskQflipperStart:
+        task_name = "qFlipper start";
+        if(!qflipper_bridge_start()) {
+            success = false;
+        }
+        break;
+    case DesktopSystemTaskQflipperStop:
+        task_name = "qFlipper stop";
+        qflipper_bridge_stop();
+        success = furi_hal_usb_composite_uninstall();
+        break;
+    case DesktopSystemTaskBluetoothToggle: {
+        bool enable = desktop->system_task_enable;
+        task_name = enable ? "Bluetooth enable" : "Bluetooth disable";
+        if(enable) {
+            Wifi* wifi = furi_record_open(RECORD_WIFI);
+            if(wifi_is_enabled(wifi)) wifi_disable(wifi);
+            furi_record_close(RECORD_WIFI);
+        }
+
+        Bt* bt = furi_record_open(RECORD_BT);
+        if(enable) bt_start_stack(bt);
+        BtSettings settings;
+        bt_get_settings(bt, &settings);
+        settings.enabled = enable;
+        bt_set_settings(bt, &settings);
+        furi_record_close(RECORD_BT);
+        break;
+    }
+    case DesktopSystemTaskWifiToggle: {
+        bool enable = desktop->system_task_enable;
+        task_name = enable ? "Wi-Fi enable" : "Wi-Fi disable";
+        Wifi* wifi = furi_record_open(RECORD_WIFI);
+        if(enable) {
+            wifi_enable(wifi);
+        } else {
+            wifi_disable(wifi);
+        }
+        furi_record_close(RECORD_WIFI);
+        break;
+    }
+    }
+
+    uint32_t elapsed_ms =
+        (furi_get_tick() - started_at) * 1000U / furi_kernel_get_tick_frequency();
+    if(success) {
+        FURI_LOG_I(TAG, "%s completed in %lu ms", task_name, (unsigned long)elapsed_ms);
+    } else {
+        FURI_LOG_E(TAG, "%s failed after %lu ms", task_name, (unsigned long)elapsed_ms);
+    }
+
+    view_dispatcher_send_custom_event(
+        desktop->view_dispatcher, DesktopGlobalSystemTaskFinished);
+    return 0;
+}
+
+static bool desktop_system_task_start(Desktop* desktop, DesktopSystemTask task, bool enable) {
+    if(desktop->system_task_pending) {
+        FURI_LOG_W(TAG, "Ignoring system toggle while another is in progress");
+        return false;
+    }
+
+    desktop->system_task = task;
+    desktop->system_task_enable = enable;
+    desktop->system_task_pending = true;
+    desktop->system_task_thread =
+        furi_thread_alloc_ex("DesktopHwToggle", 4096, desktop_system_task_worker, desktop);
+    furi_thread_start(desktop->system_task_thread);
+    return true;
+}
+
+bool desktop_system_task_is_pending(Desktop* desktop) {
+    furi_assert(desktop);
+    return desktop->system_task_pending;
+}
+
+bool desktop_system_task_start_qflipper(Desktop* desktop, bool enable) {
+    furi_assert(desktop);
+    return desktop_system_task_start(
+        desktop,
+        enable ? DesktopSystemTaskQflipperStart : DesktopSystemTaskQflipperStop,
+        enable);
+}
+
+bool desktop_system_task_toggle_bluetooth(Desktop* desktop, bool enable) {
+    furi_assert(desktop);
+    return desktop_system_task_start(desktop, DesktopSystemTaskBluetoothToggle, enable);
+}
+
+bool desktop_system_task_toggle_wifi(Desktop* desktop, bool enable) {
+    furi_assert(desktop);
+    return desktop_system_task_start(desktop, DesktopSystemTaskWifiToggle, enable);
+}
 
 /* ─── Mesh helpers (Phase 1) ─────────────────────────────────────────────
  * desktop_mesh_event_cb wird vom Mesh-Service-Worker-Task aufgerufen. Wir
@@ -239,11 +343,38 @@ static void desktop_stealth_mode_icon_draw_callback(Canvas* canvas, void* contex
     canvas_draw_icon(canvas, 0, 0, &I_Muted_8x8);
 }
 
+/* Light-sleep idle: stop the desktop's periodic work (qFlipper USB-JTAG poll
+ * every 100 ms, status-bar clock every second, dolphin animation frames) so
+ * the SoC is not woken while the screen is off. Runs in the desktop thread. */
+static void desktop_set_idle(Desktop* desktop, bool idle) {
+    if(desktop->idle == idle) return;
+    desktop->idle = idle;
+    animation_manager_set_paused(desktop->animation_manager, idle);
+    if(idle) {
+        furi_timer_stop(desktop->qflipper_usj_timer);
+        furi_timer_stop(desktop->update_clock_timer);
+    } else {
+        furi_timer_start(desktop->qflipper_usj_timer, furi_ms_to_ticks(QFLIPPER_USJ_POLL_MS));
+        desktop_clock_reconfigure(desktop); /* refreshes the clock right away */
+    }
+}
+
+/* Power-service thread: hand the change over to the desktop thread. */
+static void desktop_power_idle_callback(const void* message, void* context) {
+    furi_assert(message);
+    Desktop* desktop = context;
+    const FuriHalPowerIdleEvent* event = message;
+    view_dispatcher_send_custom_event(
+        desktop->view_dispatcher, event->idle ? DesktopGlobalIdleEnter : DesktopGlobalIdleExit);
+}
+
 static bool desktop_custom_event_callback(void* context, uint32_t event) {
     furi_assert(context);
     Desktop* desktop = (Desktop*)context;
 
-    if(event == DesktopGlobalBeforeAppStarted) {
+    if(event == DesktopGlobalIdleEnter || event == DesktopGlobalIdleExit) {
+        desktop_set_idle(desktop, event == DesktopGlobalIdleEnter);
+    } else if(event == DesktopGlobalBeforeAppStarted) {
         if(animation_manager_is_animation_loaded(desktop->animation_manager)) {
             animation_manager_unload_and_stall_animation(desktop->animation_manager);
         }
@@ -303,30 +434,41 @@ static bool desktop_custom_event_callback(void* context, uint32_t event) {
         /* Overlay-Timer abgelaufen → auf allen Mesh-Views ausblenden. */
         desktop_mesh_set_overlay_all(desktop, NULL);
 
+    } else if(event == DesktopGlobalSystemTaskFinished) {
+        if(desktop->system_task_thread) {
+            furi_thread_join(desktop->system_task_thread);
+            furi_thread_free(desktop->system_task_thread);
+            desktop->system_task_thread = NULL;
+        }
+        desktop->system_task_pending = false;
+        desktop_scene_lock_menu_refresh(desktop);
+        if(desktop->qflipper_task_deferred) {
+            bool enable = desktop->qflipper_task_deferred_enable;
+            desktop->qflipper_task_deferred = false;
+            view_dispatcher_send_custom_event(
+                desktop->view_dispatcher,
+                enable ? DesktopGlobalQflipperStart : DesktopGlobalQflipperStop);
+        }
+
     } else if(event == DesktopGlobalQflipperStop) {
-        /* Auto-off der Bridge (Host weg): derselbe Pfad wie "Disable qFlipper"
-         * im Lock-Menue — Bridge stoppen, Composite abbauen, PHY zurueck zu USJ. */
-        if(qflipper_bridge_is_active()) {
+        /* Stop the bridge off the UI thread and restore USB-Serial-JTAG. */
+        if(qflipper_bridge_is_active() && desktop->system_task_pending) {
+            desktop->qflipper_task_deferred = true;
+            desktop->qflipper_task_deferred_enable = false;
+        } else if(qflipper_bridge_is_active()) {
             FURI_LOG_I(TAG, "Host disconnected — leaving qFlipper mode");
-            qflipper_bridge_stop();
-            furi_hal_usb_composite_uninstall();
-            desktop_scene_lock_menu_refresh(desktop);
+            desktop_system_task_start_qflipper(desktop, false);
         }
 
     } else if(event == DesktopGlobalQflipperStart) {
-        /* Laeuft auf dem Desktop-Thread mit fertig hochgefahrenem System —
-         * exakt der Pfad des Lock-Menue-Toggles "Enable qFlipper". Quelle:
-         * OTA-Resume-Timer oder "qflipper"-Kommando von qT-Embed (USJ). */
         if(qflipper_bridge_is_active()) {
             FURI_LOG_D(TAG, "qFlipper bridge already active");
+        } else if(desktop->system_task_pending) {
+            desktop->qflipper_task_deferred = true;
+            desktop->qflipper_task_deferred_enable = true;
         } else {
             FURI_LOG_I(TAG, "Starting qFlipper bridge (host request / OTA resume)");
-            if(!qflipper_bridge_start()) {
-                FURI_LOG_W(TAG, "qFlipper bridge start failed (no USB-OTG on this board?)");
-            }
-            /* Falls das Lock-Menue gerade offen ist: Label "Enable" → "Disable qFlipper"
-             * nachziehen (die View liest den Zustand sonst nur beim Betreten). */
-            desktop_scene_lock_menu_refresh(desktop);
+            desktop_system_task_start_qflipper(desktop, true);
         }
 
     } else {
@@ -457,6 +599,11 @@ static void desktop_init_settings(Desktop* desktop) {
 static Desktop* desktop_alloc(void) {
     Desktop* desktop = malloc(sizeof(Desktop));
 
+    desktop->system_task_thread = NULL;
+    desktop->system_task_enable = false;
+    desktop->system_task_pending = false;
+    desktop->qflipper_task_deferred = false;
+    desktop->qflipper_task_deferred_enable = false;
     desktop->animation_semaphore = furi_semaphore_alloc(1, 0);
     desktop->animation_manager = animation_manager_alloc();
     desktop->gui = furi_record_open(RECORD_GUI);
@@ -808,6 +955,11 @@ int32_t desktop_srv(void* p) {
     /* qT-Embed kann die Bridge ueber die USB-Serial-JTAG-Konsole anfordern
      * ("qflipper\n"), siehe helpers/qflipper_usj_cmd.h. */
     furi_timer_start(desktop->qflipper_usj_timer, furi_ms_to_ticks(QFLIPPER_USJ_POLL_MS));
+
+    FuriPubSub* idle_pubsub = furi_hal_power_get_idle_pubsub();
+    if(idle_pubsub) {
+        furi_pubsub_subscribe(idle_pubsub, desktop_power_idle_callback, desktop);
+    }
 
     view_dispatcher_run(desktop->view_dispatcher);
 

@@ -112,6 +112,18 @@ void bt_stop_stack(Bt* bt);
 /** Restart BLE stack (blocking). Only starts if BT is enabled in settings. */
 void bt_start_stack(Bt* bt);
 
+/** Light sleep: stop the BLE stack if Bluetooth is enabled but idle, i.e. only
+ * advertising (no connection, RPC session, pairing, extra beacon or app
+ * profile). The ESP32 BT controller holds a NO_LIGHT_SLEEP PM lock while it
+ * runs without modem sleep, so this is what allows light sleep at all.
+ * Blocking; settings are not changed.
+ * @return true if the stack was stopped and must be resumed */
+bool bt_sleep_suspend(Bt* bt);
+
+/** Restart the stack stopped by bt_sleep_suspend(). Non-blocking (queued),
+ * so waking the UI is never delayed by the BLE bring-up. No-op otherwise. */
+void bt_sleep_resume(Bt* bt);
+
 #ifdef __cplusplus
 }
 #endif

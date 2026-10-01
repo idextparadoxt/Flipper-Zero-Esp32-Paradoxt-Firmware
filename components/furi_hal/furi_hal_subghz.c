@@ -5,17 +5,26 @@
 #include <string.h>
 
 #include <driver/rmt_tx.h>
+#include <driver/spi_master.h>
 #include <esp_attr.h>
 #include <esp_log.h>
+#include <esp_rom_sys.h>
 #include <esp_timer.h>
 #include <furi.h>
 #include <furi_hal_spi.h>
 #include <furi_hal_resources.h>
 #include <furi_hal_power.h>
+#include <furi_hal_aw9523.h>
 #include <cc1101.h>
 #include "boards/board.h"
 
 static const char* TAG = "FuriHalSubGhz";
+
+#if defined(BOARD_HAS_AW9523) && BOARD_HAS_AW9523
+#define FURI_HAL_SUBGHZ_HAS_AW9523 1
+#else
+#define FURI_HAL_SUBGHZ_HAS_AW9523 0
+#endif
 
 typedef enum {
     FuriHalSubGhzStateInit,
@@ -51,6 +60,7 @@ typedef struct {
     bool remaining_level;
     bool sequence_complete;
     volatile bool stop_requested;
+    bool sleep_inhibited;
     rmt_channel_handle_t channel;
     bool channel_enabled;
     rmt_encoder_handle_t encoder;
@@ -105,6 +115,7 @@ static FuriHalSubGhzContext furi_hal_subghz = {
             .remaining_level = true,
             .sequence_complete = true,
             .stop_requested = false,
+            .sleep_inhibited = false,
             .channel = NULL,
             .encoder = NULL,
         },
@@ -113,7 +124,10 @@ static FuriHalSubGhzContext furi_hal_subghz = {
 #define FURI_HAL_SUBGHZ_RMT_RESOLUTION_HZ     (1000000u)
 #define FURI_HAL_SUBGHZ_RMT_MEM_BLOCK_SYMBOLS (64u)
 #define FURI_HAL_SUBGHZ_RMT_TX_QUEUE_DEPTH    (1u)
-#define FURI_HAL_SUBGHZ_RMT_MAX_DURATION_TICKS (UINT16_MAX)
+/* rmt_symbol_word_t durations are 15-bit fields. A larger chunk is silently
+ * truncated (mod 32768): long gaps shrink, and an exact multiple of 32768
+ * becomes 0, which the RMT treats as the end marker and stops the TX early. */
+#define FURI_HAL_SUBGHZ_RMT_MAX_DURATION_TICKS (0x7FFFu)
 
 static volatile uint32_t furi_hal_subghz_rx_irq_count = 0;
 
@@ -201,6 +215,13 @@ static void furi_hal_subghz_async_tx_prepare(FuriHalSubGhzAsyncTx* async_tx) {
     async_tx->remaining_level = true;
     async_tx->sequence_complete = false;
     async_tx->stop_requested = false;
+}
+
+static void furi_hal_subghz_async_tx_release_sleep_inhibit(FuriHalSubGhzAsyncTx* async_tx) {
+    if(async_tx->sleep_inhibited) {
+        async_tx->sleep_inhibited = false;
+        furi_hal_power_insomnia_exit();
+    }
 }
 
 static bool furi_hal_subghz_async_tx_next_chunk(
@@ -384,13 +405,31 @@ static void furi_hal_subghz_async_tx_free_backend(FuriHalSubGhzAsyncTx* async_tx
     }
 }
 
+/* Leaving SPWD (or right after power-up) the CC1101 holds SO high (CHIP_RDYn)
+ * until its crystal is stable, typically ~150 us. The datasheet expects the
+ * master to wait for SO low after CSn; the ESP32 SPI master can't, so anything
+ * clocked in earlier is lost and reads back as 0xFF. At 200 kHz the slow
+ * transfers hid this; at 2 MHz the boot probe could finish before the chip
+ * woke up. Poll the status byte (each SNOP also pulls CSn low) until ready. */
+static bool furi_hal_subghz_wait_chip_ready_locked(void) {
+    for(uint32_t i = 0; i < 20; i++) {
+        if(cc1101_status_is_ready(cc1101_get_status(&furi_hal_spi_bus_handle_subghz))) {
+            return true;
+        }
+        esp_rom_delay_us(100);
+    }
+    return false;
+}
+
 static bool furi_hal_subghz_probe_read(FuriHalSubGhzProbe* probe, bool reset_radio) {
     furi_check(probe);
     memset(probe, 0, sizeof(*probe));
 
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
+    furi_hal_subghz_wait_chip_ready_locked();
     if(reset_radio) {
         probe->reset_status = cc1101_reset(&furi_hal_spi_bus_handle_subghz);
+        furi_hal_subghz_wait_chip_ready_locked(); // SRES drops CHIP_RDYn again
     }
     probe->status = cc1101_get_status(&furi_hal_spi_bus_handle_subghz);
     probe->partnumber = cc1101_get_partnumber(&furi_hal_spi_bus_handle_subghz);
@@ -399,6 +438,35 @@ static bool furi_hal_subghz_probe_read(FuriHalSubGhzProbe* probe, bool reset_rad
 
     return (probe->partnumber != 0x00 && probe->partnumber != 0xFF) ||
            (probe->version != 0x00 && probe->version != 0xFF);
+}
+
+static bool furi_hal_subghz_wait_for_state_impl(
+    CC1101State state,
+    uint32_t timeout_us,
+    bool spi_locked) {
+    const int64_t deadline_us = esp_timer_get_time() + timeout_us;
+
+    do {
+        if(!spi_locked) furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
+        const CC1101Status status = cc1101_get_status(&furi_hal_spi_bus_handle_subghz);
+        if(!spi_locked) furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
+        if(cc1101_status_state(status) == state) return true;
+
+        const int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if(remaining_us <= 0) break;
+        const uint32_t delay_us = (remaining_us < 20) ? (uint32_t)remaining_us : 20;
+        esp_rom_delay_us(delay_us);
+    } while(true);
+
+    return false;
+}
+
+bool furi_hal_subghz_wait_for_state_locked(CC1101State state, uint32_t timeout_us) {
+    return furi_hal_subghz_wait_for_state_impl(state, timeout_us, true);
+}
+
+bool furi_hal_subghz_wait_for_state(CC1101State state, uint32_t timeout_us) {
+    return furi_hal_subghz_wait_for_state_impl(state, timeout_us, false);
 }
 
 static void furi_hal_subghz_log_probe(const FuriHalSubGhzProbe* probe, bool connected) {
@@ -465,6 +533,19 @@ const GpioPin* furi_hal_subghz_get_data_gpio(void) {
 void furi_hal_subghz_init(void) {
     /* Note: BOARD_PIN_PWR_EN is set in furi_hal_init_early() */
 
+#if defined(BOARD_CC1101_SPI_HOST) && defined(BOARD_PIN_RADIO_SPI_MOSI) && \
+    defined(BOARD_PIN_RADIO_SPI_MISO) && defined(BOARD_PIN_RADIO_SPI_SCK)
+    ESP_LOGI(
+        TAG,
+        "Dedicated radio SPI: host=%d MOSI=%u MISO=%u SCK=%u CC1101_CSN=%u NRF24_CSN=%u",
+        BOARD_CC1101_SPI_HOST,
+        (unsigned)BOARD_PIN_RADIO_SPI_MOSI,
+        (unsigned)BOARD_PIN_RADIO_SPI_MISO,
+        (unsigned)BOARD_PIN_RADIO_SPI_SCK,
+        (unsigned)BOARD_PIN_CC1101_CSN,
+        (unsigned)BOARD_PIN_NRF24_CSN);
+#endif
+
 #if defined(BOARD_PIN_CC1101_SW0) && defined(BOARD_PIN_CC1101_SW1) && \
     BOARD_PIN_CC1101_SW0 != UINT16_MAX && BOARD_PIN_CC1101_SW1 != UINT16_MAX
     /* Initialize RF band-select switch GPIOs */
@@ -479,6 +560,9 @@ void furi_hal_subghz_init(void) {
 
     FuriHalSubGhzProbe probe = {0};
     furi_hal_spi_bus_handle_init(&furi_hal_spi_bus_handle_subghz);
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    furi_hal_aw9523_init();
+#endif
     furi_hal_subghz.connected = furi_hal_subghz_probe_read(&probe, true);
     furi_hal_subghz_log_probe(&probe, furi_hal_subghz.connected);
     furi_hal_subghz.state = FuriHalSubGhzStateIdle;
@@ -490,6 +574,11 @@ void furi_hal_subghz_init(void) {
      * chip is in after any app; apps reconfigure it from sleep on entry. The
      * PWR_EN rail itself must stay up because it also feeds the fuel gauge. */
     if(furi_hal_subghz.connected) {
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+        if(!furi_hal_aw9523_set_idle()) {
+            ESP_LOGW(TAG, "AW9523 front-end idle state could not be verified");
+        }
+#endif
         furi_hal_subghz_sleep();
     }
 }
@@ -497,10 +586,34 @@ void furi_hal_subghz_init(void) {
 void furi_hal_subghz_sleep(void) {
     if(furi_hal_subghz.state == FuriHalSubGhzStateInit) furi_hal_subghz_init();
 
+    /* Sleep is also used by application teardown. Stop asynchronous
+     * peripherals first so no GPIO/RMT callback can access the CC1101 while
+     * it is being powered down. */
+    if(furi_hal_subghz.state == FuriHalSubGhzStateAsyncRx) {
+        furi_hal_subghz_stop_async_rx();
+    } else if(furi_hal_subghz.state == FuriHalSubGhzStateAsyncTx) {
+        furi_hal_subghz_stop_async_tx();
+    }
+
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
+    /* The chip may already be in SLEEP (app teardown, then shutdown): strobes
+     * clocked in before CHIP_RDYn goes low are lost, so the SPWD below would
+     * silently not happen and the radio would stay in IDLE (~1.7 mA). */
+    furi_hal_subghz_wait_chip_ready_locked();
     cc1101_switch_to_idle(&furi_hal_spi_bus_handle_subghz);
+    /* SWRS061I section 4.4: the 0.2 uA SLEEP current is specified with every GDO
+     * programmed to 0x2F (HW to 0). GDO0/GDO2 then drive low in SLEEP, matching
+     * the MCU-side pull-down, instead of floating (0x2E) or toggling. IOCFG1 is
+     * left alone: GDO1 is the shared SPI MISO and must stay 3-state. IOCFGx are
+     * retained in SLEEP; apps reload them after SRES (furi_hal_subghz_reset). */
+    cc1101_write_reg(&furi_hal_spi_bus_handle_subghz, CC1101_IOCFG0, CC1101IocfgHW);
+    cc1101_write_reg(&furi_hal_spi_bus_handle_subghz, CC1101_IOCFG2, CC1101IocfgHW);
+    /* SPWD takes effect when CSn goes high, i.e. on the release below. */
     cc1101_shutdown(&furi_hal_spi_bus_handle_subghz);
     furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    (void)furi_hal_aw9523_set_idle();
+#endif
     furi_hal_subghz.state = FuriHalSubGhzStateIdle;
 }
 
@@ -605,8 +718,10 @@ void furi_hal_subghz_shutdown(void) {
 
 void furi_hal_subghz_reset(void) {
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
+    furi_hal_subghz_wait_chip_ready_locked();
     cc1101_switch_to_idle(&furi_hal_spi_bus_handle_subghz);
     cc1101_reset(&furi_hal_spi_bus_handle_subghz);
+    furi_hal_subghz_wait_chip_ready_locked(); // SRES drops CHIP_RDYn again
     cc1101_write_reg(&furi_hal_spi_bus_handle_subghz, CC1101_IOCFG0, CC1101IocfgHighImpedance);
     furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
     FuriHalSubGhzProbe probe = {0};
@@ -614,27 +729,71 @@ void furi_hal_subghz_reset(void) {
 }
 
 void furi_hal_subghz_idle(void) {
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    (void)furi_hal_aw9523_set_idle();
+#endif
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
     cc1101_switch_to_idle(&furi_hal_spi_bus_handle_subghz);
-    cc1101_wait_status_state(&furi_hal_spi_bus_handle_subghz, CC1101StateIDLE, 10000);
     furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
+    if(!furi_hal_subghz_wait_for_state(CC1101StateIDLE, 10000)) {
+        ESP_LOGW(TAG, "CC1101 did not reach IDLE");
+    }
     furi_hal_subghz.state = FuriHalSubGhzStateIdle;
 }
 
-void furi_hal_subghz_rx(void) {
+bool furi_hal_subghz_rx(void) {
+    if(!furi_hal_subghz.connected) {
+        ESP_LOGE(TAG, "Cannot enter RX: CC1101 is not connected");
+        return false;
+    }
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    const bool rf_frontend_ok = furi_hal_aw9523_set_rx();
+    if(!rf_frontend_ok) {
+        ESP_LOGE(TAG, "Refusing CC1101 RX: AW9523 RXEN was not verified");
+        return false;
+    }
+#endif
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
     cc1101_switch_to_rx(&furi_hal_spi_bus_handle_subghz);
-    cc1101_wait_status_state(&furi_hal_spi_bus_handle_subghz, CC1101StateRX, 10000);
     furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
+    const bool radio_ok = furi_hal_subghz_wait_for_state(CC1101StateRX, 10000);
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    ESP_LOGI(TAG, "CC1101 RX %s (AW9523 RXEN verified)", radio_ok ? "active" : "failed");
+#else
+    ESP_LOGI(TAG, "CC1101 RX %s", radio_ok ? "active" : "failed");
+#endif
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    if(!radio_ok) (void)furi_hal_aw9523_set_idle();
+#endif
+    return radio_ok;
 }
 
 bool furi_hal_subghz_tx(void) {
     if(furi_hal_subghz.regulation != FuriHalSubGhzRegulationTxRx) return false;
+    if(!furi_hal_subghz.connected) {
+        ESP_LOGE(TAG, "Cannot enter TX: CC1101 is not connected");
+        return false;
+    }
 
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    const bool rf_frontend_ok = furi_hal_aw9523_set_tx();
+    if(!rf_frontend_ok) {
+        ESP_LOGE(TAG, "Refusing CC1101 TX: AW9523 TXEN was not verified");
+        return false;
+    }
+#endif
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
     cc1101_switch_to_tx(&furi_hal_spi_bus_handle_subghz);
-    bool ok = cc1101_wait_status_state(&furi_hal_spi_bus_handle_subghz, CC1101StateTX, 10000);
     furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
+    const bool ok = furi_hal_subghz_wait_for_state(CC1101StateTX, 10000);
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    ESP_LOGI(TAG, "CC1101 TX %s (AW9523 TXEN verified)", ok ? "active" : "failed");
+#else
+    ESP_LOGI(TAG, "CC1101 TX %s", ok ? "active" : "failed");
+#endif
+#if FURI_HAL_SUBGHZ_HAS_AW9523
+    if(!ok) (void)furi_hal_aw9523_set_idle();
+#endif
     return ok;
 }
 
@@ -703,8 +862,10 @@ uint32_t furi_hal_subghz_set_frequency(uint32_t value) {
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
     uint32_t real_frequency = cc1101_set_frequency(&furi_hal_spi_bus_handle_subghz, value);
     cc1101_calibrate(&furi_hal_spi_bus_handle_subghz);
-    cc1101_wait_status_state(&furi_hal_spi_bus_handle_subghz, CC1101StateIDLE, 10000);
     furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
+    if(!furi_hal_subghz_wait_for_state(CC1101StateIDLE, 10000)) {
+        ESP_LOGW(TAG, "CC1101 calibration did not reach IDLE");
+    }
 
     ESP_LOGD(TAG, "set_frequency: requested=%lu real=%lu", (unsigned long)value, (unsigned long)real_frequency);
     furi_hal_subghz.frequency = real_frequency;
@@ -752,6 +913,14 @@ void furi_hal_subghz_set_path(FuriHalSubGhzPath path) {
 
 void furi_hal_subghz_start_async_rx(FuriHalSubGhzCaptureCallback callback, void* context) {
     furi_check(callback);
+    if(furi_hal_subghz.state != FuriHalSubGhzStateIdle) {
+        ESP_LOGW(TAG, "Cannot start async RX while Sub-GHz state is %d", furi_hal_subghz.state);
+        return;
+    }
+    if(!furi_hal_subghz.connected) {
+        ESP_LOGE(TAG, "Cannot start async RX: CC1101 is not connected");
+        return;
+    }
 
     /* Hold insomnia for the whole RX session. The CC1101 GDO0 capture is a plain
      * GPIO interrupt that would NOT fire during light sleep (it is not a
@@ -771,7 +940,16 @@ void furi_hal_subghz_start_async_rx(FuriHalSubGhzCaptureCallback callback, void*
     furi_hal_gpio_init(&gpio_cc1101_g0, GpioModeInterruptRiseFall, GpioPullNo, GpioSpeedLow);
     furi_hal_gpio_add_int_callback(
         &gpio_cc1101_g0, furi_hal_subghz_capture_gpio_callback, NULL);
-    furi_hal_subghz_rx();
+    if(!furi_hal_subghz_rx()) {
+        furi_hal_gpio_remove_int_callback(&gpio_cc1101_g0);
+        furi_hal_gpio_init(&gpio_cc1101_g0, GpioModeInput, GpioPullNo, GpioSpeedLow);
+        furi_hal_subghz.async_rx_callback = NULL;
+        furi_hal_subghz.async_rx_context = NULL;
+        furi_hal_subghz.state = FuriHalSubGhzStateIdle;
+        furi_hal_power_insomnia_exit();
+        ESP_LOGE(TAG, "Async RX start aborted: radio or RF front-end setup failed");
+        return;
+    }
 
     /* Read CC1101 status to verify RX mode */
     furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
@@ -784,6 +962,8 @@ void furi_hal_subghz_start_async_rx(FuriHalSubGhzCaptureCallback callback, void*
 }
 
 void furi_hal_subghz_stop_async_rx(void) {
+    if(furi_hal_subghz.state != FuriHalSubGhzStateAsyncRx) return;
+
     furi_hal_gpio_remove_int_callback(&gpio_cc1101_g0);
     furi_hal_gpio_init(&gpio_cc1101_g0, GpioModeInput, GpioPullNo, GpioSpeedLow);
     furi_hal_subghz.async_rx_callback = NULL;
@@ -803,6 +983,8 @@ bool furi_hal_subghz_start_async_tx(FuriHalSubGhzAsyncTxCallback callback, void*
     if(furi_hal_subghz.regulation != FuriHalSubGhzRegulationTxRx) return false;
 
     FuriHalSubGhzAsyncTx* async_tx = &furi_hal_subghz.async_tx;
+    furi_hal_power_insomnia_enter();
+    async_tx->sleep_inhibited = true;
     async_tx->callback = callback;
     async_tx->callback_context = context;
     furi_hal_subghz_async_tx_prepare(async_tx);
@@ -820,10 +1002,12 @@ bool furi_hal_subghz_start_async_tx(FuriHalSubGhzAsyncTxCallback callback, void*
     esp_err_t error = furi_hal_subghz_async_tx_alloc_backend(async_tx);
     if(error != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize RMT TX backend: %s", esp_err_to_name(error));
+        furi_hal_subghz_async_tx_free_backend(async_tx);
         async_tx->callback = NULL;
         async_tx->callback_context = NULL;
         furi_hal_subghz.async_tx_complete = true;
         furi_hal_subghz.state = FuriHalSubGhzStateIdle;
+        furi_hal_subghz_async_tx_release_sleep_inhibit(async_tx);
         return false;
     }
 
@@ -833,6 +1017,7 @@ bool furi_hal_subghz_start_async_tx(FuriHalSubGhzAsyncTxCallback callback, void*
         furi_hal_subghz.async_tx_complete = true;
         furi_hal_subghz.state = FuriHalSubGhzStateIdle;
         furi_hal_subghz_async_tx_free_backend(async_tx);
+        furi_hal_subghz_async_tx_release_sleep_inhibit(async_tx);
         return false;
     }
 
@@ -845,10 +1030,14 @@ bool furi_hal_subghz_start_async_tx(FuriHalSubGhzAsyncTxCallback callback, void*
         async_tx->callback_context = NULL;
         furi_hal_subghz.async_tx_complete = true;
         furi_hal_subghz.state = FuriHalSubGhzStateIdle;
+        furi_hal_subghz_async_tx_release_sleep_inhibit(async_tx);
         return false;
     }
 
-    static const uint8_t tx_marker = 0xA5;
+    /* rmt_transmit() validates the source payload before invoking the
+     * encoder. Keep the marker in internal RAM; a static const object would
+     * normally be placed in flash and is rejected by the RMT driver. */
+    static DRAM_ATTR uint8_t tx_marker = 0xA5;
     const rmt_transmit_config_t tx_config = {
         .loop_count = 0,
         .flags =
@@ -866,6 +1055,7 @@ bool furi_hal_subghz_start_async_tx(FuriHalSubGhzAsyncTxCallback callback, void*
         async_tx->callback_context = NULL;
         furi_hal_subghz.async_tx_complete = true;
         furi_hal_subghz.state = FuriHalSubGhzStateIdle;
+        furi_hal_subghz_async_tx_release_sleep_inhibit(async_tx);
         return false;
     }
 
@@ -884,12 +1074,20 @@ void furi_hal_subghz_stop_async_tx(void) {
     FuriHalSubGhzAsyncTx* async_tx = &furi_hal_subghz.async_tx;
     async_tx->stop_requested = true;
 
+    /* Leave TX before letting go of GDO0: in asynchronous TX the CC1101 keys
+       the carrier from that pin, so releasing it first could transmit
+       whatever level the floating input settles at until IDLE is reached. */
+    furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
+    cc1101_switch_to_idle(&furi_hal_spi_bus_handle_subghz);
+    furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
+
     /* free_backend() disables the channel, which also aborts a transmission
        still in flight — no separate abort call (it would fail with
        INVALID_STATE and make the RMT driver log an error). */
     furi_hal_subghz_async_tx_free_backend(async_tx);
 
-    furi_hal_gpio_init(&gpio_cc1101_g0, GpioModeInput, GpioPullNo, GpioSpeedLow);
+    /* Pull down so the next TX entry starts with the carrier keyed off. */
+    furi_hal_gpio_init(&gpio_cc1101_g0, GpioModeInput, GpioPullDown, GpioSpeedLow);
     if(furi_hal_subghz.async_mirror_pin) {
         furi_hal_gpio_write(furi_hal_subghz.async_mirror_pin, false);
     }
@@ -915,4 +1113,5 @@ void furi_hal_subghz_stop_async_tx(void) {
     furi_hal_subghz.async_tx_complete = true;
     furi_hal_subghz.state = FuriHalSubGhzStateIdle;
     furi_hal_subghz_idle();
+    furi_hal_subghz_async_tx_release_sleep_inhibit(async_tx);
 }

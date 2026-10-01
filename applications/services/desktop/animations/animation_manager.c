@@ -45,7 +45,9 @@ struct AnimationManager {
     void* context;
     FuriString* freezed_animation_name;
     int32_t freezed_animation_time_left;
+    int32_t paused_idle_time_left;
     ViewStack* view_stack;
+    bool paused;
 
     bool dummy_mode            : 1;
     bool blocking_shown_url    : 1;
@@ -421,6 +423,18 @@ static StorageAnimation*
         }
     }
 
+    if(whole_weight == 0) {
+        FURI_LOG_W(TAG, "No valid idle animations available; using built-in animation");
+        for
+            M_EACH(item, animation_list, StorageAnimationList_t) {
+                animation_storage_free_storage_animation(item);
+            }
+        StorageAnimationList_clear(animation_list);
+        StorageAnimation* fallback = animation_storage_find_animation(HARDCODED_ANIMATION_NAME);
+        furi_assert(fallback);
+        return fallback;
+    }
+
     uint32_t lucky_number = furi_hal_random_get() % whole_weight;
     uint32_t weight = 0;
 
@@ -458,6 +472,34 @@ static StorageAnimation*
 bool animation_manager_is_animation_loaded(AnimationManager* animation_manager) {
     furi_assert(animation_manager);
     return animation_manager->current_animation;
+}
+
+void animation_manager_set_paused(AnimationManager* animation_manager, bool paused) {
+    furi_assert(animation_manager);
+    if(animation_manager->paused == paused) return;
+    animation_manager->paused = paused;
+    bubble_animation_set_paused(animation_manager->animation_view, paused);
+
+    /* The idle-animation rotation timer would otherwise load a new animation
+     * from storage while the screen is off. Keep its remaining time. */
+    if(paused) {
+        animation_manager->paused_idle_time_left = 0;
+        if(animation_manager->state == AnimationManagerStateIdle &&
+           furi_timer_is_running(animation_manager->idle_animation_timer)) {
+            int32_t left = (int32_t)(furi_timer_get_expire_time(
+                                         animation_manager->idle_animation_timer) -
+                                     furi_get_tick());
+            animation_manager->paused_idle_time_left = left > 0 ? left : 1;
+            furi_timer_stop(animation_manager->idle_animation_timer);
+        }
+    } else if(animation_manager->paused_idle_time_left) {
+        if(animation_manager->state == AnimationManagerStateIdle) {
+            furi_timer_start(
+                animation_manager->idle_animation_timer,
+                (uint32_t)animation_manager->paused_idle_time_left);
+        }
+        animation_manager->paused_idle_time_left = 0;
+    }
 }
 
 void animation_manager_unload_and_stall_animation(AnimationManager* animation_manager) {

@@ -4,7 +4,21 @@
  * API mirrors STM32 Flipper firmware (lib/drivers/bq27220.c).
  *
  * I2C address: 0x55
- * Bus: Qwiic/Grove (SDA=GPIO8, SCL=GPIO18 on T-Embed CC1101)
+ * Bus: Qwiic/Grove (shared with BQ25896 and the PN532)
+ *
+ * Notes from TI SLUUBD4A (BQ27220 TRM), chapter 5:
+ *  - Do not read the standard commands more than twice per second, or the
+ *    gauge watchdog may reset it. Everything is therefore read into one cached
+ *    snapshot, refreshed at most once per FURI_HAL_BQ27220_SNAPSHOT_MAX_AGE_MS.
+ *  - Keep t(BUF) >= 66 us bus-free time between packets.
+ *  - The gauge may stretch SCL for up to 4 ms (100 us in SLEEP mode).
+ *  - I2C traffic does not take the gauge out of its own SLEEP mode; only a
+ *    current above Sleep Current does.
+ *
+ * Data memory is NOT written here. The CEDV profile (capacity, EDV points,
+ * discharge curve) is cell specific; writing a wrong profile makes SoC worse
+ * than the ROM defaults. The design capacity is compared with the board value
+ * at init and a mismatch is logged so it can be configured deliberately.
  */
 
 #include "furi_hal_bq27220.h"
@@ -12,59 +26,170 @@
 
 #include <driver/i2c.h>
 #include <esp_log.h>
+#include <esp_rom_sys.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <string.h>
 
 static const char* TAG = "BQ27220";
 
-/* Registers */
-#define BQ27220_REG_TEMP        0x06
-#define BQ27220_REG_VOLT        0x08
-#define BQ27220_REG_BAT_STATUS  0x0A
-#define BQ27220_REG_CURR        0x0C
-#define BQ27220_REG_REMAIN_CAP  0x10
-#define BQ27220_REG_FULL_CAP    0x12
-#define BQ27220_REG_CHARGE_PCT  0x2C
-#define BQ27220_REG_HEALTH_PCT  0x2E
-#define BQ27220_REG_DESIGN_CAP  0x3C
+/* Standard commands (TI SLUUBD4A table 2-1) */
+#define BQ27220_CMD_CONTROL          0x00
+#define BQ27220_CMD_TEMPERATURE      0x06
+#define BQ27220_CMD_REMAINING_CAP    0x10
+#define BQ27220_CMD_CYCLE_COUNT      0x2A
+#define BQ27220_CMD_OPERATION_STATUS 0x3A
+#define BQ27220_CMD_DESIGN_CAP       0x3C
+#define BQ27220_CMD_MAC_DATA         0x40
 
-/* I2C configuration — shared with NFC (PN532) and Qwiic */
-#if defined(BOARD_PIN_QWIIC_SDA) && defined(BOARD_PIN_QWIIC_SCL)
-#define BQ_I2C_FREQ_HZ  100000
-#define BQ_I2C_TIMEOUT  (1000 / portTICK_PERIOD_MS)
-#else
-#define BQ_I2C_PORT     I2C_NUM_0
-#define BQ_I2C_SDA      8
-#define BQ_I2C_SCL      18
-#define BQ_I2C_FREQ_HZ  100000
-#define BQ_I2C_TIMEOUT  (1000 / portTICK_PERIOD_MS)
+/* Control() subcommands */
+#define BQ27220_CTRL_DEVICE_NUMBER 0x0001
+#define BQ27220_CTRL_FW_VERSION    0x0002
+
+#define BQ27220_DEVICE_ID 0x0220
+
+#ifndef BQ_I2C_PORT
+#define BQ_I2C_PORT I2C_NUM_0
+#endif
+
+#ifndef BQ27220_ADDR
+#define BQ27220_ADDR 0x55
+#endif
+
+/* Covers the 4 ms worst-case clock stretch with margin. */
+#define BQ27220_I2C_TIMEOUT pdMS_TO_TICKS(100)
+#define BQ27220_I2C_RETRIES 2
+/* t(BUF) is 66 us; a little extra costs nothing at one snapshot per second. */
+#define BQ27220_BUS_FREE_US 100
+/* Upstream Flipper driver: MAC reads fail below ~500 us after a subcommand. */
+#define BQ27220_SUBCMD_DELAY_US 1000
+
+#ifndef FURI_HAL_BQ27220_SNAPSHOT_MAX_AGE_MS
+#define FURI_HAL_BQ27220_SNAPSHOT_MAX_AGE_MS 1000U
 #endif
 
 static bool bq27220_initialized = false;
 static bool bq27220_present = false;
+static uint16_t bq27220_design_capacity_mah = 0;
+static uint16_t bq27220_device_number = 0;
+static uint16_t bq27220_fw_version = 0;
+static SemaphoreHandle_t bq27220_mutex = NULL;
+static FuriHalBq27220Snapshot bq27220_snapshot = {0};
+static bool bq27220_snapshot_attempted = false;
+static TickType_t bq27220_snapshot_attempt_tick = 0;
+static uint32_t bq27220_error_count = 0;
 
-static bool bq27220_i2c_read(uint8_t reg, uint8_t* data, size_t len) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (BQ27220_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (BQ27220_ADDR << 1) | I2C_MASTER_READ, true);
-    if(len > 1) {
-        i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
+static bool bq27220_read(uint8_t reg, uint8_t* data, size_t len) {
+    for(int attempt = 0; attempt < BQ27220_I2C_RETRIES; attempt++) {
+        const esp_err_t err = i2c_master_write_read_device(
+            BQ_I2C_PORT, BQ27220_ADDR, &reg, 1, data, len, BQ27220_I2C_TIMEOUT);
+        esp_rom_delay_us(BQ27220_BUS_FREE_US);
+        if(err == ESP_OK) return true;
     }
-    i2c_master_read_byte(cmd, &data[len - 1], I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin(BQ_I2C_PORT, cmd, BQ_I2C_TIMEOUT);
-    i2c_cmd_link_delete(cmd);
-    return err == ESP_OK;
+    return false;
 }
 
-static uint16_t bq27220_read_word(uint8_t reg) {
+static bool bq27220_read_word(uint8_t reg, uint16_t* value) {
     uint8_t data[2] = {0};
-    if(!bq27220_i2c_read(reg, data, 2)) {
-        return 0;
+    if(!bq27220_read(reg, data, sizeof(data))) return false;
+    *value = (uint16_t)((uint16_t)data[1] << 8 | data[0]);
+    return true;
+}
+
+/* Control() subcommand whose result is returned in MACData (upstream bq27220.c). */
+static bool bq27220_read_subcommand(uint16_t subcommand, uint16_t* value) {
+    const uint8_t cmd[3] = {
+        BQ27220_CMD_CONTROL, (uint8_t)(subcommand & 0xFF), (uint8_t)(subcommand >> 8)};
+    if(i2c_master_write_to_device(BQ_I2C_PORT, BQ27220_ADDR, cmd, sizeof(cmd), BQ27220_I2C_TIMEOUT) !=
+       ESP_OK) {
+        return false;
     }
-    return ((uint16_t)data[1] << 8) | data[0];
+    esp_rom_delay_us(BQ27220_SUBCMD_DELAY_US);
+    return bq27220_read_word(BQ27220_CMD_MAC_DATA, value);
+}
+
+static inline uint16_t bq27220_le16(const uint8_t* p) {
+    return (uint16_t)((uint16_t)p[1] << 8 | p[0]);
+}
+
+/* Four incremental reads cover every command the firmware uses:
+ *   0x06..0x0D Temperature, Voltage, BatteryStatus, Current
+ *   0x10..0x19 RemainingCapacity, FullChargeCapacity, AverageCurrent, TimeToEmpty, TimeToFull
+ *   0x2A..0x2F CycleCount, StateOfCharge, StateOfHealth
+ *   0x3A       OperationStatus
+ * Caller holds bq27220_mutex. */
+static bool bq27220_refresh_locked(void) {
+    uint8_t a[8], b[10], c[6], d[2];
+    if(!bq27220_read(BQ27220_CMD_TEMPERATURE, a, sizeof(a)) ||
+       !bq27220_read(BQ27220_CMD_REMAINING_CAP, b, sizeof(b)) ||
+       !bq27220_read(BQ27220_CMD_CYCLE_COUNT, c, sizeof(c)) ||
+       !bq27220_read(BQ27220_CMD_OPERATION_STATUS, d, sizeof(d))) {
+        return false;
+    }
+
+    const uint16_t voltage_mv = bq27220_le16(&a[2]);
+    const uint16_t soc = bq27220_le16(&c[2]);
+    /* A gauge that is still initializing, or a bus glitch returning zeros,
+     * must not be mistaken for an empty battery. */
+    if(voltage_mv < 2000U || voltage_mv > 5000U || soc > 100U) {
+        return false;
+    }
+
+    FuriHalBq27220Snapshot* s = &bq27220_snapshot;
+    s->temperature_dk = bq27220_le16(&a[0]);
+    s->voltage_mv = voltage_mv;
+    s->battery_status = bq27220_le16(&a[4]);
+    s->current_ma = (int16_t)bq27220_le16(&a[6]);
+    s->remaining_capacity_mah = bq27220_le16(&b[0]);
+    s->full_charge_capacity_mah = bq27220_le16(&b[2]);
+    s->average_current_ma = (int16_t)bq27220_le16(&b[4]);
+    s->time_to_empty_min = bq27220_le16(&b[6]);
+    s->time_to_full_min = bq27220_le16(&b[8]);
+    s->cycle_count = bq27220_le16(&c[0]);
+    s->state_of_charge = soc;
+    s->state_of_health = bq27220_le16(&c[4]);
+    if(s->state_of_health > 100U) s->state_of_health = 100U;
+    s->operation_status = bq27220_le16(&d[0]);
+    s->tick = xTaskGetTickCount();
+    s->valid = true;
+    s->fresh = true;
+    return true;
+}
+
+static bool bq27220_snapshot_get(FuriHalBq27220Snapshot* out) {
+    if(!bq27220_present || !bq27220_mutex) {
+        if(out) memset(out, 0, sizeof(*out));
+        return false;
+    }
+    if(xSemaphoreTake(bq27220_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        /* Another thread is stuck in a slow refresh (bus trouble): hand out the
+         * last snapshot rather than zeros, which would read as an empty battery.
+         * Each field is word sized, so a concurrent update cannot tear one. */
+        FuriHalBq27220Snapshot last = bq27220_snapshot;
+        last.fresh = false;
+        if(out) *out = last;
+        return last.valid;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t max_age = pdMS_TO_TICKS(FURI_HAL_BQ27220_SNAPSHOT_MAX_AGE_MS);
+    /* Rate limit attempts too, so a dead bus is not hammered by every getter. */
+    if(!bq27220_snapshot_attempted || (TickType_t)(now - bq27220_snapshot_attempt_tick) >= max_age) {
+        bq27220_snapshot_attempted = true;
+        bq27220_snapshot_attempt_tick = now;
+        if(!bq27220_refresh_locked()) {
+            bq27220_snapshot.fresh = false;
+            if(bq27220_error_count++ % 30U == 0U) {
+                ESP_LOGW(TAG, "Snapshot read failed (errors=%lu); keeping last values",
+                    (unsigned long)bq27220_error_count);
+            }
+        }
+    }
+    if(out) *out = bq27220_snapshot;
+    const bool valid = bq27220_snapshot.valid;
+    xSemaphoreGive(bq27220_mutex);
+    return valid;
 }
 
 bool furi_hal_bq27220_init(void) {
@@ -73,14 +198,22 @@ bool furi_hal_bq27220_init(void) {
     bq27220_initialized = true;
 
     /* I2C bus assumed already initialized by furi_hal_power_init() */
+    if(!bq27220_mutex) {
+        bq27220_mutex = xSemaphoreCreateMutex();
+        if(!bq27220_mutex) {
+            ESP_LOGE(TAG, "Mutex allocation failed; gauge disabled");
+            return false;
+        }
+    }
 
     /* Probe: check if device ACKs at 0x55 */
     i2c_cmd_handle_t probe_cmd = i2c_cmd_link_create();
     i2c_master_start(probe_cmd);
     i2c_master_write_byte(probe_cmd, (BQ27220_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_stop(probe_cmd);
-    esp_err_t probe_err = i2c_master_cmd_begin(BQ_I2C_PORT, probe_cmd, BQ_I2C_TIMEOUT);
+    esp_err_t probe_err = i2c_master_cmd_begin(BQ_I2C_PORT, probe_cmd, BQ27220_I2C_TIMEOUT);
     i2c_cmd_link_delete(probe_cmd);
+    esp_rom_delay_us(BQ27220_BUS_FREE_US);
 
     if(probe_err != ESP_OK) {
         ESP_LOGW(TAG, "BQ27220 not found at 0x%02X (no ACK)", BQ27220_ADDR);
@@ -88,14 +221,59 @@ bool furi_hal_bq27220_init(void) {
         return false;
     }
 
-    /* Device present — read key registers */
-    uint16_t voltage = bq27220_read_word(BQ27220_REG_VOLT);
-    uint16_t pct = bq27220_read_word(BQ27220_REG_CHARGE_PCT);
-    uint16_t design_cap = bq27220_read_word(BQ27220_REG_DESIGN_CAP);
+    if(bq27220_read_subcommand(BQ27220_CTRL_DEVICE_NUMBER, &bq27220_device_number) &&
+       bq27220_device_number != BQ27220_DEVICE_ID) {
+        ESP_LOGW(
+            TAG,
+            "Unexpected device number 0x%04X (BQ27220 = 0x%04X); continuing",
+            bq27220_device_number,
+            BQ27220_DEVICE_ID);
+    }
+    if(!bq27220_read_subcommand(BQ27220_CTRL_FW_VERSION, &bq27220_fw_version)) {
+        bq27220_fw_version = 0;
+    }
+    if(!bq27220_read_word(BQ27220_CMD_DESIGN_CAP, &bq27220_design_capacity_mah)) {
+        bq27220_design_capacity_mah = 0;
+    }
 
     bq27220_present = true;
-    ESP_LOGI(TAG, "BQ27220 found: voltage=%umV charge=%u%% design_cap=%umAh",
-        voltage, pct, design_cap);
+    FuriHalBq27220Snapshot s;
+    bq27220_snapshot_get(&s);
+
+    ESP_LOGI(
+        TAG,
+        "BQ27220 found: dev=0x%04X fw=0x%04X voltage=%umV soc=%u%% soh=%u%% design=%umAh "
+        "fcc=%umAh cycles=%u status=0x%04X op=0x%04X%s",
+        bq27220_device_number,
+        bq27220_fw_version,
+        s.voltage_mv,
+        s.state_of_charge,
+        s.state_of_health,
+        bq27220_design_capacity_mah,
+        s.full_charge_capacity_mah,
+        s.cycle_count,
+        s.battery_status,
+        s.operation_status,
+        s.valid ? "" : " (snapshot invalid)");
+
+    if(s.valid && !(s.operation_status & FURI_HAL_BQ27220_OPSTATUS_INITCOMP)) {
+        ESP_LOGW(TAG, "Gauge initialization not complete yet; SoC may settle in a few seconds");
+    }
+#ifdef FURI_HAL_POWER_VIRTUAL_CAPACITY_MAH
+    if(bq27220_design_capacity_mah) {
+        const uint32_t board = FURI_HAL_POWER_VIRTUAL_CAPACITY_MAH;
+        const uint32_t gauge = bq27220_design_capacity_mah;
+        const uint32_t diff = gauge > board ? gauge - board : board - gauge;
+        if(diff * 10U > board) {
+            ESP_LOGW(
+                TAG,
+                "Gauge design capacity %lumAh differs from board battery %lumAh: the gauge "
+                "profile is not configured for this cell, SoC/capacity will be approximate",
+                (unsigned long)gauge,
+                (unsigned long)board);
+        }
+    }
+#endif
 
     return bq27220_present;
 }
@@ -104,53 +282,93 @@ bool furi_hal_bq27220_is_present(void) {
     return bq27220_present;
 }
 
+bool furi_hal_bq27220_get_snapshot(FuriHalBq27220Snapshot* out) {
+    return bq27220_snapshot_get(out);
+}
+
 uint8_t furi_hal_bq27220_get_charge_pct(void) {
-    if(!bq27220_present) return 0;
-    uint16_t pct = bq27220_read_word(BQ27220_REG_CHARGE_PCT);
-    if(pct > 100) pct = 100;
-    return (uint8_t)pct;
+    FuriHalBq27220Snapshot s;
+    if(!bq27220_snapshot_get(&s)) return 0;
+    return (uint8_t)s.state_of_charge;
 }
 
 bool furi_hal_bq27220_is_charging(void) {
-    if(!bq27220_present) return false;
-    uint16_t status = bq27220_read_word(BQ27220_REG_BAT_STATUS);
-    /* DSG bit (bit 0): 1 = discharging, 0 = charging */
-    return (status & 0x0001) == 0;
+    FuriHalBq27220Snapshot s;
+    if(!bq27220_snapshot_get(&s)) return false;
+    /* DSG bit (bit 0): 1 = discharging, 0 = charging/relaxation */
+    return (s.battery_status & FURI_HAL_BQ27220_STATUS_DSG) == 0;
+}
+
+bool furi_hal_bq27220_is_full_charged(void) {
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) && (s.battery_status & FURI_HAL_BQ27220_STATUS_FC);
+}
+
+bool furi_hal_bq27220_is_sysdown(void) {
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) && s.fresh &&
+           (s.battery_status & FURI_HAL_BQ27220_STATUS_SYSDWN);
 }
 
 uint16_t furi_hal_bq27220_get_voltage_mv(void) {
-    if(!bq27220_present) return 0;
-    return bq27220_read_word(BQ27220_REG_VOLT);
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.voltage_mv : 0;
 }
 
 int16_t furi_hal_bq27220_get_current_ma(void) {
-    if(!bq27220_present) return 0;
-    return (int16_t)bq27220_read_word(BQ27220_REG_CURR);
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.current_ma : 0;
+}
+
+int16_t furi_hal_bq27220_get_average_current_ma(void) {
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.average_current_ma : 0;
 }
 
 uint8_t furi_hal_bq27220_get_health_pct(void) {
-    if(!bq27220_present) return 0;
-    uint16_t health = bq27220_read_word(BQ27220_REG_HEALTH_PCT);
-    if(health > 100) health = 100;
-    return (uint8_t)health;
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? (uint8_t)s.state_of_health : 0;
 }
 
 uint16_t furi_hal_bq27220_get_temperature_raw(void) {
-    if(!bq27220_present) return 0;
-    return bq27220_read_word(BQ27220_REG_TEMP);
+    FuriHalBq27220Snapshot s;
+    /* 2981 = 25.0 C, so a missing reading never shows up as -273 C. */
+    return bq27220_snapshot_get(&s) ? s.temperature_dk : 2981U;
 }
 
 uint16_t furi_hal_bq27220_get_remaining_capacity_mah(void) {
-    if(!bq27220_present) return 0;
-    return bq27220_read_word(BQ27220_REG_REMAIN_CAP);
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.remaining_capacity_mah : 0;
 }
 
 uint16_t furi_hal_bq27220_get_full_charge_capacity_mah(void) {
-    if(!bq27220_present) return 0;
-    return bq27220_read_word(BQ27220_REG_FULL_CAP);
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.full_charge_capacity_mah : 0;
 }
 
 uint16_t furi_hal_bq27220_get_design_capacity_mah(void) {
-    if(!bq27220_present) return 0;
-    return bq27220_read_word(BQ27220_REG_DESIGN_CAP);
+    return bq27220_present ? bq27220_design_capacity_mah : 0;
+}
+
+uint16_t furi_hal_bq27220_get_time_to_empty_min(void) {
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.time_to_empty_min : FURI_HAL_BQ27220_TIME_NONE;
+}
+
+uint16_t furi_hal_bq27220_get_time_to_full_min(void) {
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.time_to_full_min : FURI_HAL_BQ27220_TIME_NONE;
+}
+
+uint16_t furi_hal_bq27220_get_cycle_count(void) {
+    FuriHalBq27220Snapshot s;
+    return bq27220_snapshot_get(&s) ? s.cycle_count : 0;
+}
+
+uint16_t furi_hal_bq27220_get_device_number(void) {
+    return bq27220_device_number;
+}
+
+uint16_t furi_hal_bq27220_get_fw_version(void) {
+    return bq27220_fw_version;
 }

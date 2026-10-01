@@ -41,6 +41,8 @@ typedef enum {
     BtMessageTypeReloadKeysSettings,
     BtMessageTypeStopStack,
     BtMessageTypeStartStack,
+    BtMessageTypeSleepSuspend,
+    BtMessageTypeSleepResume,
 } BtMessageType;
 
 typedef struct {
@@ -92,6 +94,8 @@ struct Bt {
     void* status_changed_ctx;
     uint32_t pin;
     bool suppress_pin_screen;
+    /* BLE stack stopped by the power service for light sleep (settings still enabled). */
+    bool sleep_suspended;
 
     /* Intermediate RX buffer: GATTS callback writes here (non-blocking),
      * dedicated feeder thread drains into RPC session (can block safely). */

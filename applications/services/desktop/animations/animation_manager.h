@@ -151,6 +151,10 @@ bool animation_manager_is_animation_loaded(AnimationManager* animation_manager);
  */
 void animation_manager_unload_and_stall_animation(AnimationManager* animation_manager);
 
+/** Pause/resume frame and rotation timers while the device is idle (screen off,
+ * light sleep). Animation state is untouched, so it is safe in every state. */
+void animation_manager_set_paused(AnimationManager* animation_manager, bool paused);
+
 /**
  * Load and Continue execution of animation manager.
  *

@@ -35,6 +35,8 @@ struct Power {
     bool show_battery_low_warning;
     uint8_t displayBatteryPercentage;
     bool is_otg_requested;
+    bool shutdown_in_progress;
+    bool poweroff_prompt_active;
     uint8_t battery_level;
     uint8_t power_off_timeout;
     PowerSettings settings;
@@ -43,6 +45,17 @@ struct Power {
     FuriPubSub* input_events_pubsub;
     FuriPubSubSubscription* input_events_subscription;
     bool charge_is_supressed;
+    bool battery_critical;
+    uint32_t battery_critical_tick;
+    uint32_t light_sleep_display_off_since;
+    uint32_t light_sleep_display_transition_count;
+    /* Light-sleep idle state: entered = BT parked, LED dark, charger ADC off,
+     * idle published, gate granted and the tick slowed down. */
+    volatile bool light_sleep_entered;
+    volatile bool light_sleep_wake_pending;
+    bool light_sleep_bt_suspended;
+    bool light_sleep_led_off;
+    FuriPubSubSubscription* light_sleep_input_subscription;
 };
 
 typedef enum {
@@ -52,6 +65,7 @@ typedef enum {
 
 typedef enum {
     PowerMessageTypeShutdown,
+    PowerMessageTypeShowPoweroffConfirmation,
     PowerMessageTypeReboot,
     PowerMessageTypeGetInfo,
     PowerMessageTypeIsBatteryHealthy,
@@ -60,6 +74,7 @@ typedef enum {
     PowerMessageTypeSetSettings,
     PowerMessageTypeReloadSettings,
     PowerMessageTypeSwitchOTG,
+    PowerMessageTypeLightSleepWake,
 } PowerMessageType;
 
 typedef struct {

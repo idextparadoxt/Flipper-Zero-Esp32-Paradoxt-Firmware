@@ -162,8 +162,7 @@ static Bt* bt_alloc(void) {
     bt->gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(bt->gui, bt->statusbar_view_port, GuiLayerStatusBarLeft);
 
-    /* RPC — initialize here (STM32 does this in a separate rpc_srv thread) */
-    rpc_init();
+    /* The rpc_start service creates RECORD_RPC before the BT service starts. */
     bt->rpc = furi_record_open(RECORD_RPC);
     bt->rpc_event = furi_event_flag_alloc();
 
@@ -627,6 +626,31 @@ static void bt_handle_start_stack(Bt* bt) {
     FURI_LOG_I(TAG, "BLE stack started");
 }
 
+/* Runs in the BT service thread, so the checks and the stop are atomic with
+ * respect to GAP/RPC events, which are serialized through the same queue. */
+static bool bt_handle_sleep_suspend(Bt* bt) {
+    if(bt->sleep_suspended) return true;
+    if(!bt->bt_settings.enabled || bt->status != BtStatusAdvertising) return false;
+    if(bt->beacon_active || bt->rpc_session || bt->pin_code) return false;
+    if(furi_hal_bt_extra_beacon_is_active()) return false;
+    if(bt->current_profile &&
+       !furi_hal_bt_check_profile_type(bt->current_profile, ble_profile_serial)) {
+        return false; /* an app profile (HID, ...) is in use */
+    }
+    FURI_LOG_I(TAG, "Light sleep: stopping idle BLE stack");
+    bt_handle_stop_stack(bt);
+    bt->sleep_suspended = true;
+    return true;
+}
+
+static void bt_handle_sleep_resume(Bt* bt) {
+    if(!bt->sleep_suspended) return;
+    bt->sleep_suspended = false;
+    if(!bt->bt_settings.enabled) return;
+    FURI_LOG_I(TAG, "Light sleep ended: restarting BLE stack");
+    bt_handle_start_stack(bt);
+}
+
 static void bt_init_keys_settings(Bt* bt) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     furi_pubsub_subscribe(storage_get_pubsub(storage), bt_storage_callback, bt);
@@ -780,6 +804,30 @@ void bt_start_stack(Bt* bt) {
     api_lock_wait_unlock_and_free(message.lock);
 }
 
+bool bt_sleep_suspend(Bt* bt) {
+    furi_assert(bt);
+    bool result = false;
+    BtMessage message = {
+        .lock = api_lock_alloc_locked(),
+        .type = BtMessageTypeSleepSuspend,
+        .result = &result,
+    };
+    furi_check(
+        furi_message_queue_put(bt->message_queue, &message, FuriWaitForever) == FuriStatusOk);
+    api_lock_wait_unlock_and_free(message.lock);
+    return result;
+}
+
+void bt_sleep_resume(Bt* bt) {
+    furi_assert(bt);
+    BtMessage message = {
+        .lock = NULL,
+        .type = BtMessageTypeSleepResume,
+    };
+    furi_check(
+        furi_message_queue_put(bt->message_queue, &message, FuriWaitForever) == FuriStatusOk);
+}
+
 /* ---- Service main loop ---- */
 
 int32_t bt_srv(void* p) {
@@ -871,7 +919,13 @@ int32_t bt_srv(void* p) {
         } else if(message.type == BtMessageTypeStopStack) {
             bt_handle_stop_stack(bt);
         } else if(message.type == BtMessageTypeStartStack) {
+            bt->sleep_suspended = false;
             bt_handle_start_stack(bt);
+        } else if(message.type == BtMessageTypeSleepSuspend) {
+            const bool suspended = bt_handle_sleep_suspend(bt);
+            if(message.result) *message.result = suspended;
+        } else if(message.type == BtMessageTypeSleepResume) {
+            bt_handle_sleep_resume(bt);
         }
 
         if(message.lock) api_lock_unlock(message.lock);

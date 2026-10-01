@@ -59,8 +59,21 @@ typedef struct {
     bool format_12; // 1 - 12 hour, 0 - 24H
 } DesktopClock;
 
+typedef enum {
+    DesktopSystemTaskQflipperStart,
+    DesktopSystemTaskQflipperStop,
+    DesktopSystemTaskBluetoothToggle,
+    DesktopSystemTaskWifiToggle,
+} DesktopSystemTask;
+
 struct Desktop {
     FuriThread* scene_thread;
+    FuriThread* system_task_thread;
+    DesktopSystemTask system_task;
+    bool system_task_enable;
+    bool system_task_pending;
+    bool qflipper_task_deferred;
+    bool qflipper_task_deferred_enable;
 
     Gui* gui;
     ViewDispatcher* view_dispatcher;
@@ -112,6 +125,7 @@ struct Desktop {
     bool in_transition;
     bool app_running;
     bool locked;
+    bool idle; /* light-sleep idle: periodic timers paused */
 
     /* Mesh-State. Der T-Embed ist immer Master (kein Mode mehr). mesh_pending
      * hält die Daten zum letzten Service-Event, das der Background-Service ans
@@ -154,3 +168,7 @@ void desktop_mesh_event_cb(const MeshEventData* ev, void* ctx);
 /* Lock-Menue-Zustaende (qFlipper/BT/WiFi-Labels) neu einlesen — auch von
  * ausserhalb der Scene aufrufbar (Auto-off der qFlipper-Bridge). */
 void desktop_scene_lock_menu_refresh(Desktop* desktop);
+bool desktop_system_task_is_pending(Desktop* desktop);
+bool desktop_system_task_start_qflipper(Desktop* desktop, bool enable);
+bool desktop_system_task_toggle_bluetooth(Desktop* desktop, bool enable);
+bool desktop_system_task_toggle_wifi(Desktop* desktop, bool enable);

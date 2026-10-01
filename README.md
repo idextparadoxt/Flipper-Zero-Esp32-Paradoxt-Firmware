@@ -283,6 +283,35 @@ Boards: `t_embed` (default), `esp32s3`, `waveshare_c6` (or `waveshare_c6_1.9`), 
 ./buildFap.sh applications/main/my_app
 ```
 
+### Power management (screen-off light sleep)
+
+With **Settings → Notification → Auto Light Sleep** on, the device light-sleeps
+once the screen has been off for the selected delay, on battery, with no app
+running. Waking is instant (no reboot) on any button.
+
+While light-sleeping:
+
+- Bluetooth that is enabled but idle (advertising only) is stopped and restarted
+  on wake; a connection, RPC session, pairing, beacon or app profile keeps it on
+  (and keeps the device awake). The ESP32 BT controller blocks light sleep while
+  it runs without modem sleep.
+- No periodic wake-ups: buttons are GPIO wake sources, the desktop clock,
+  animations, qFlipper USB poll, WiFi icon, night shift and Spectrum timers are
+  paused, and the power service checks the fuel gauge once a minute.
+- The charger is not polled; VBUS is cached right before sleeping and the
+  BQ25896 battery-monitor ADC is off. A charging current seen by the gauge
+  (USB plugged in) wakes the device.
+- Every connected pad has a defined sleep state (no floating CS/RST/gate lines);
+  the WS2812 ring is blacked out and its data line held low; the CC1101 sits in
+  SLEEP with GDO pins at 0x2F (0.2 uA typ) and the PN532 in PowerDown.
+
+Battery protection: below 3.35 V (fuel gauge, 3 consecutive samples) the
+low-battery dialog opens; below 3.25 V or on gauge SYSDWN the battery is
+disconnected immediately (BQ25896 ship mode).
+
+Shutting down on USB enters deep sleep; it wakes every 10 minutes to check USB
+and disconnects the battery (ship mode) once USB is gone.
+
 ### Debug: light-sleep telemetry
 
 Idle light sleep (screen off, on battery) is gated at runtime and runs silently.
@@ -294,7 +323,8 @@ lightsleep: allow=1 count=1234 slept=48000ms/50000ms (96%) wake[t=1230 g=4 o=0]
 ```
 
 Counters persist while the device stays powered, so idling on battery and then
-reconnecting USB reports the sleep accumulated during the battery window. Leave
+reconnecting USB reports the sleep accumulated during the battery window. The
+input service blocks while light-sleeping, so lines appear again after waking. Leave
 the option off for normal builds; it adds a small always-on callback.
 
 ## Porting Approach

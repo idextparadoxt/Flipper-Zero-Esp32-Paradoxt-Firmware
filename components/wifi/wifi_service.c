@@ -4,6 +4,7 @@
 #include "wlan_passwords.h"
 
 #include <furi.h>
+#include <furi_hal_power.h>
 #include <api_lock.h>
 #include <btshim.h>
 #include <gui/gui.h>
@@ -97,6 +98,18 @@ static void wifi_icon_timer_cb(void* context) {
     if(connected != wifi->icon_connected) {
         wifi->icon_connected = connected;
         if(wifi->icon_enabled) view_port_update(wifi->statusbar_vp);
+    }
+}
+
+/* Light-sleep idle: the icon poll would wake the SoC every second for an icon
+ * nobody can see. WiFi itself inhibits light sleep while it is running. */
+static void wifi_power_idle_callback(const void* message, void* context) {
+    const FuriHalPowerIdleEvent* event = message;
+    Wifi* wifi = context;
+    if(event->idle) {
+        furi_timer_stop(wifi->icon_timer);
+    } else {
+        furi_timer_start(wifi->icon_timer, furi_ms_to_ticks(1000));
     }
 }
 
@@ -247,6 +260,8 @@ int32_t wifi_srv(void* p) {
     wifi->icon_connected = false;
     wifi->icon_timer = furi_timer_alloc(wifi_icon_timer_cb, FuriTimerTypePeriodic, wifi);
     furi_timer_start(wifi->icon_timer, furi_ms_to_ticks(1000));
+    FuriPubSub* idle_pubsub = furi_hal_power_get_idle_pubsub();
+    if(idle_pubsub) furi_pubsub_subscribe(idle_pubsub, wifi_power_idle_callback, wifi);
 
     /* Settings-Load bis nach dem SD-Mount aufschieben: dieser Service startet vor
      * StorageSrv, und der Runtime-Save landet in der SD-Datei (/ext → SD). Läden

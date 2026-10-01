@@ -6,16 +6,44 @@
 
 #include <update_util/update_operation.h>
 #include <notification/notification_messages.h>
+#include <notification/notification.h>
 
 #include <loader/loader.h>
+#include <furi_hal_sd.h>
+#include <wifi.h>
+#include <btshim.h>
+#include "boards/board.h"
 
 #define TAG "Power"
 
 #define POWER_OFF_TIMEOUT_S  (90U)
 #define POWER_POLL_PERIOD_MS (1000UL)
+/* While light-sleeping only battery protection runs, from the fuel gauge alone
+ * (no charger/VBUS access). The battery drains slowly in light sleep and the
+ * protection still needs its consecutive samples, so once a minute is plenty. */
+#define POWER_LIGHT_SLEEP_POLL_PERIOD_MS (60000UL)
+/* A refused power-off (e.g. USB plugged in at that instant) is retried. */
+#define POWER_CRITICAL_RETRY_MS (30000UL)
+/* Fuel-gauge current above this while light-sleeping means a charger is
+ * feeding the battery: USB was plugged in. Wake so USB can enumerate, without
+ * ever polling the charger's VBUS registers during sleep. */
+#define POWER_LIGHT_SLEEP_CHARGE_WAKE_A (0.020f)
 
 #define POWER_VBUS_LOW_THRESHOLD   (4.0f)
 #define POWER_HEALTH_LOW_THRESHOLD (70U)
+
+static void power_set_notification_led_sleeping(bool sleeping) {
+    NotificationApp* notification = furi_record_open(RECORD_NOTIFICATION);
+    notification_set_led_sleeping(notification, sleeping);
+    furi_record_close(RECORD_NOTIFICATION);
+}
+
+/* Only touch the notification service on an actual change, not every tick. */
+static void power_set_led_sleeping(Power* power, bool sleeping) {
+    if(power->light_sleep_led_off == sleeping) return;
+    power->light_sleep_led_off = sleeping;
+    power_set_notification_led_sleeping(sleeping);
+}
 
 static void power_draw_battery_callback(Canvas* canvas, void* context) {
     furi_assert(context);
@@ -297,6 +325,49 @@ static void power_check_charging_state(Power* power) {
     furi_record_close(RECORD_NOTIFICATION);
 }
 
+static bool power_check_manual_poweroff(Power* power) {
+    if(!power->poweroff_prompt_active) return false;
+
+    PowerOffResponse response = power_off_get_response(power->view_power_off);
+    if(response == PowerOffResponseOk) {
+        power->poweroff_prompt_active = false;
+        FURI_LOG_I(TAG, "Power-off confirmation accepted");
+        power_off(power);
+    } else if(response == PowerOffResponseCancel || response == PowerOffResponseHide) {
+        power->poweroff_prompt_active = false;
+        FURI_LOG_I(TAG, "Power-off confirmation cancelled");
+        view_holder_set_view(power->view_holder, NULL);
+        power_off_reset_response(power->view_power_off);
+    }
+    return true;
+}
+
+static void power_tick_callback(void* context);
+static void power_light_sleep_exit(Power* power);
+
+/* Critical level: disconnect the battery now. No cancellable dialog: below this
+ * the cell is being deep-discharged and the 3.3 V rail is close to brown-out,
+ * which only ends in reset loops that drain it further. */
+static bool power_check_critical_battery(Power* power) {
+    if(!furi_hal_power_is_critical_shutdown_requested()) {
+        power->battery_critical = false;
+        return false;
+    }
+    const uint32_t now = furi_get_tick();
+    if(power->battery_critical &&
+       (now - power->battery_critical_tick) < furi_ms_to_ticks(POWER_CRITICAL_RETRY_MS)) {
+        return false;
+    }
+    power->battery_critical = true;
+    power->battery_critical_tick = now;
+    FURI_LOG_E(TAG, "Battery critical: powering off to protect the cell");
+    /* Leave light sleep first; if the power-off is refused (USB plugged in at
+     * that moment) the device must be fully awake again, BLE included. */
+    power_light_sleep_exit(power);
+    power_off(power);
+    return true;
+}
+
 static void power_check_low_battery(Power* power) {
     if(!power->info.gauge_is_ok) {
         return;
@@ -306,9 +377,19 @@ static void power_check_low_battery(Power* power) {
     if((power->info.is_shutdown_requested) &&
        (power->info.voltage_vbus < POWER_VBUS_LOW_THRESHOLD) && power->show_battery_low_warning) {
         if(!power->battery_low) {
+            NotificationApp* notification = furi_record_open(RECORD_NOTIFICATION);
+            notification_message(notification, &sequence_low_battery);
+            furi_record_close(RECORD_NOTIFICATION);
+            power_off_set_manual(power->view_power_off, false);
             view_holder_send_to_front(power->view_holder);
             view_holder_set_view(power->view_holder, power_off_get_view(power->view_power_off));
         }
+        /* Resync every tick, not just on the false->true transition. If a
+         * manual button shutdown interrupted this dialog and set
+         * manual=true, then got cancelled, battery_low was already true and
+         * the block above never re-runs -> the low-battery dialog would
+         * keep showing manual-shutdown text on the next warning cycle. */
+        power_off_set_manual(power->view_power_off, false);
         power->battery_low = true;
     } else {
         if(power->battery_low) {
@@ -362,14 +443,68 @@ void power_trigger_ui_update(Power* power) {
     view_port_update(power->battery_view_port);
 }
 
+#if defined(BOARD_HAS_BQ25896_SHIP_MODE)
+static void power_prepare_for_shutdown(void) {
+    FURI_LOG_I(TAG, "Shutdown prepare: checking active application");
+    Loader* loader = furi_record_open(RECORD_LOADER);
+    if(loader) {
+        if(loader_is_locked(loader)) {
+            /* The ESP32 loader API does not expose FuriSignalExit. Do not
+             * claim that the application stopped; the power transition below
+             * remains responsible for terminating the process. */
+            FURI_LOG_W(TAG, "Active application is still running during shutdown");
+        } else {
+            FURI_LOG_I(TAG, "No active application is running");
+        }
+        furi_record_close(RECORD_LOADER);
+    }
+
+    FURI_LOG_I(TAG, "Shutdown prepare: flushing storage");
+    if(furi_hal_sd_is_mounted()) {
+        if(!furi_hal_sd_unmount()) {
+            FURI_LOG_E(TAG, "SD unmount failed before shutdown");
+        } else {
+            FURI_LOG_I(TAG, "SD card unmounted before shutdown");
+        }
+    } else {
+        FURI_LOG_I(TAG, "SD card already unmounted");
+    }
+
+    /* Display and notification hardware teardown is owned by the HAL. */
+}
+#endif
+
 static void power_handle_shutdown(Power* power) {
+    power->shutdown_in_progress = true;
+    power->is_otg_requested = false;
+    furi_hal_power_disable_otg();
+    FURI_LOG_I(TAG, "Shutdown latch set; power polling and OTG requests are now blocked");
+    NotificationApp* notification = furi_record_open(RECORD_NOTIFICATION);
+    notification_message_block(notification, &sequence_shutdown);
+    furi_record_close(RECORD_NOTIFICATION);
+#if defined(BOARD_HAS_BQ25896_SHIP_MODE)
+    /* Always attempt the BQ25896 BATFET path on supported boards. USB power
+     * still falls back to deep sleep because VBUS keeps SYS powered. */
+    power_prepare_for_shutdown();
+    FURI_LOG_I(TAG, "BQ25896 shutdown: requesting charger power-off path");
+    if(!furi_hal_power_off()) {
+        FURI_LOG_E(TAG, "BQ25896 shutdown aborted; device remains awake");
+        power->shutdown_in_progress = false;
+        return;
+    }
+#else
     if(power->settings.off_mode == PowerOffModePowerOff) {
         /* Real power-off (charger ship mode on battery, deep-sleep fallback on USB) */
-        furi_hal_power_off();
+        if(!furi_hal_power_off()) {
+            FURI_LOG_E(TAG, "Power-off aborted; device remains awake");
+            power->shutdown_in_progress = false;
+            return;
+        }
     } else {
         /* Default: ESP32 deep sleep */
         furi_hal_power_shutdown();
     }
+#endif
     /* Neither returns normally (deep sleep / battery cut).
      * If one does, halt as fallback. */
     furi_halt("Power off failed");
@@ -458,8 +593,9 @@ static void power_auto_poweroff_timer_callback(void* context) {
     furi_assert(context);
     Power* power = context;
 
-    //Dont poweroff device if charger connected
-    if(furi_hal_power_is_charging()) {
+    // Dont poweroff device if charger connected. Charging may be suppressed
+    // (charge limit), so USB presence counts as "charger connected" as well.
+    if(furi_hal_power_is_charging() || furi_hal_power_is_usb_connected()) {
         FURI_LOG_D(TAG, "We dont auto_power_off until battery is charging");
         power_start_auto_poweroff_timer(power);
         return;
@@ -516,6 +652,9 @@ static void power_loader_callback(const void* message, void* context) {
     if(event->type == LoaderEventTypeApplicationBeforeLoad) {
         power->app_running = true;
         power_auto_poweroff_disarm(power);
+        power->light_sleep_display_off_since = 0;
+        /* Revoking the grant also queues the light-sleep wake message. */
+        furi_hal_power_allow_light_sleep(false);
         // arm timer if some apps was not loaded or was stoped
     } else if(event->type == LoaderEventTypeNoMoreAppsInQueue) {
         power->app_running = false;
@@ -531,6 +670,153 @@ static void power_settings_apply(Power* power) {
     } else if(power_is_running_auto_poweroff_timer(power)) {
         power_auto_poweroff_disarm(power);
     }
+    furi_hal_power_set_light_sleep_policy(
+        power->settings.light_sleep_enabled, power->settings.light_sleep_delay_ms);
+}
+
+/* Queue the wake message (any thread, never blocks, at most one pending). */
+static void power_light_sleep_request_wake(Power* power) {
+    if(!power->light_sleep_entered || power->light_sleep_wake_pending) return;
+    power->light_sleep_wake_pending = true;
+    PowerMessage msg = {.type = PowerMessageTypeLightSleepWake};
+    if(furi_message_queue_put(power->message_queue, &msg, 0) != FuriStatusOk) {
+        /* Queue full: the next (slow) tick notices the revoked grant instead. */
+        power->light_sleep_wake_pending = false;
+    }
+}
+
+static void power_light_sleep_revoke_callback(void* context) {
+    power_light_sleep_request_wake(context);
+}
+
+static void power_light_sleep_input_callback(const void* value, void* context) {
+    UNUSED(value);
+    power_light_sleep_request_wake(context);
+}
+
+static void power_light_sleep_enter(Power* power) {
+    /* Last VBUS read before sleeping: light sleep only ever uses this cache. */
+    furi_hal_power_refresh_vbus_cache();
+    if(!furi_hal_power_is_running_on_battery()) return;
+
+    FURI_LOG_I(TAG, "Light sleep: entering");
+
+    /* 1. Bluetooth enabled but idle (advertising only): stop the stack. The BT
+     *    controller holds a NO_LIGHT_SLEEP lock while it runs. In use (connected,
+     *    RPC, pairing, beacon, app profile) it is left alone and light sleep
+     *    stays blocked by its inhibit. */
+    Bt* bt = furi_record_open(RECORD_BT);
+    power->light_sleep_bt_suspended = bt_sleep_suspend(bt);
+    furi_record_close(RECORD_BT);
+
+    /* 2. WS2812 ring: black frame now, data line held low while asleep. */
+    power_set_led_sleeping(power, true);
+
+    /* 3. Charger battery monitor off (its REGN raises quiescent current). */
+    furi_hal_power_set_charger_adc_enabled(false);
+
+    /* 4. Pause periodic timers in other services (clock, icons, animations). */
+    furi_hal_power_publish_idle_state(true);
+
+    /* 5. Grant light sleep; the HAL opens the gate once no inhibitor is held. */
+    power->light_sleep_entered = true;
+    power->light_sleep_wake_pending = false;
+    furi_hal_power_allow_light_sleep(true);
+
+    /* 6. Stop waking up every second. */
+    furi_event_loop_tick_set(
+        power->event_loop, POWER_LIGHT_SLEEP_POLL_PERIOD_MS, power_tick_callback, power);
+}
+
+static void power_light_sleep_exit(Power* power) {
+    if(!power->light_sleep_entered) return;
+    power->light_sleep_entered = false;
+
+    furi_hal_power_allow_light_sleep(false);
+    furi_event_loop_tick_set(power->event_loop, POWER_POLL_PERIOD_MS, power_tick_callback, power);
+    furi_hal_power_set_charger_adc_enabled(true);
+    furi_hal_power_refresh_vbus_cache();
+    furi_hal_power_publish_idle_state(false);
+    power_set_led_sleeping(power, false);
+    if(power->light_sleep_bt_suspended) {
+        power->light_sleep_bt_suspended = false;
+        Bt* bt = furi_record_open(RECORD_BT);
+        bt_sleep_resume(bt); /* queued: the UI does not wait for the BLE bring-up */
+        furi_record_close(RECORD_BT);
+    }
+    /* The configured delay starts again from the next screen-off. */
+    power->light_sleep_display_off_since = 0;
+    power->light_sleep_wake_pending = false;
+    FURI_LOG_I(TAG, "Light sleep: woke up");
+}
+
+/* Close a pending grant without spinning the mutex every second. */
+static void power_light_sleep_hold_awake(Power* power, bool reset_delay) {
+    if(reset_delay) power->light_sleep_display_off_since = 0;
+    power_set_led_sleeping(power, false);
+    if(furi_hal_power_is_light_sleep_requested()) {
+        furi_hal_power_allow_light_sleep(false);
+    }
+}
+
+static void power_light_sleep_tick(Power* power) {
+    if(power->light_sleep_entered) {
+        /* Fallback for a wake message that could not be queued. */
+        if(!furi_hal_display_is_asleep() || !furi_hal_power_is_light_sleep_requested()) {
+            power_light_sleep_exit(power);
+        }
+        return;
+    }
+
+    uint32_t display_transition_count;
+    const bool display_is_asleep =
+        furi_hal_display_get_sleep_state(&display_transition_count);
+    if(display_transition_count != power->light_sleep_display_transition_count) {
+        power->light_sleep_display_transition_count = display_transition_count;
+        power->light_sleep_display_off_since = 0;
+    }
+
+    if(!display_is_asleep || !furi_hal_power_is_running_on_battery()) {
+        power_light_sleep_hold_awake(power, true);
+        return;
+    }
+
+    Loader* loader = furi_record_open(RECORD_LOADER);
+    const bool app_running = loader_is_locked(loader);
+    furi_record_close(RECORD_LOADER);
+    if(app_running) {
+        power_light_sleep_hold_awake(power, true);
+        return;
+    }
+
+    const uint32_t now = furi_get_tick();
+    if(power->light_sleep_display_off_since == 0) {
+        power->light_sleep_display_off_since = now ? now : 1;
+    }
+
+    uint32_t delay_ms = 0;
+    const bool enabled = furi_hal_power_get_light_sleep_policy(&delay_ms);
+    if(!enabled) {
+        power_light_sleep_hold_awake(power, false);
+        return;
+    }
+    const uint32_t elapsed_ms = (uint32_t)(
+        (uint64_t)(now - power->light_sleep_display_off_since) * 1000U /
+        furi_kernel_get_tick_frequency());
+    if(elapsed_ms < delay_ms) {
+        power_light_sleep_hold_awake(power, false);
+        return;
+    }
+
+    Wifi* wifi = furi_record_open(RECORD_WIFI);
+    const bool wifi_connected = wifi && wifi_is_connected(wifi);
+    furi_record_close(RECORD_WIFI);
+    if(wifi_connected) {
+        power_light_sleep_hold_awake(power, false);
+        return;
+    }
+
+    power_light_sleep_enter(power);
 }
 
 // do something depend from power queue message
@@ -545,7 +831,18 @@ static void power_message_callback(FuriEventLoopObject* object, void* context) {
 
     switch(msg.type) {
     case PowerMessageTypeShutdown:
+        if(power->shutdown_in_progress) break;
         power_handle_shutdown(power);
+        break;
+    case PowerMessageTypeShowPoweroffConfirmation:
+        if(!power->shutdown_in_progress && !power->poweroff_prompt_active) {
+            power->poweroff_prompt_active = true;
+            FURI_LOG_I(TAG, "Showing power-off confirmation");
+            power_off_set_manual(power->view_power_off, true);
+            power_off_reset_response(power->view_power_off);
+            view_holder_send_to_front(power->view_holder);
+            view_holder_set_view(power->view_holder, power_off_get_view(power->view_power_off));
+        }
         break;
     case PowerMessageTypeReboot:
         power_handle_reboot(msg.boot_mode);
@@ -574,17 +871,24 @@ static void power_message_callback(FuriEventLoopObject* object, void* context) {
         power_settings_apply(power);
         break;
     case PowerMessageTypeSwitchOTG:
+        if(power->shutdown_in_progress) {
+            power->is_otg_requested = false;
+            furi_hal_power_disable_otg();
+            break;
+        }
         power->is_otg_requested = *msg.bool_param;
         if(power->is_otg_requested) {
+            power->info.voltage_vbus = furi_hal_power_get_usb_voltage();
             // Only try to enable if VBUS voltage is low, otherwise charger will refuse
             if(power->info.voltage_vbus < 4.5f) {
-                size_t retries = 5;
-                while(retries-- > 0) {
+                bool enabled = false;
+                for(size_t attempt = 0; attempt < 5; attempt++) {
                     if(furi_hal_power_enable_otg()) {
+                        enabled = true;
                         break;
                     }
                 }
-                if(!retries) {
+                if(!enabled) {
                     FURI_LOG_W(TAG, "Failed to enable OTG, will try later");
                 }
             } else {
@@ -596,6 +900,10 @@ static void power_message_callback(FuriEventLoopObject* object, void* context) {
         } else {
             furi_hal_power_disable_otg();
         }
+        break;
+    case PowerMessageTypeLightSleepWake:
+        power->light_sleep_wake_pending = false;
+        power_light_sleep_exit(power);
         break;
     default:
         furi_crash();
@@ -627,6 +935,30 @@ static void power_charge_supress(Power* power) {
 static void power_tick_callback(void* context) {
     furi_assert(context);
     Power* power = context;
+
+    if(power->shutdown_in_progress) return;
+    if(power_check_manual_poweroff(power)) return;
+
+    power_light_sleep_tick(power);
+
+    if(power->light_sleep_entered) {
+        /* Light sleep: fuel gauge only, the charger is not touched. */
+        if(power_check_critical_battery(power)) return;
+        if(furi_hal_power_get_battery_current(FuriHalPowerICFuelGauge) >
+           POWER_LIGHT_SLEEP_CHARGE_WAKE_A) {
+            FURI_LOG_I(TAG, "Light sleep: battery is charging (USB plugged in), waking up");
+            power_light_sleep_exit(power);
+            return;
+        }
+        const uint8_t charge = furi_hal_power_get_pct();
+        if(charge != power->info.charge) {
+            power->info.charge = charge;
+            power_check_battery_level_change(power);
+        }
+        return;
+    }
+
+    if(power_check_critical_battery(power)) return;
 
     // Update data from gauge and charger
     const bool need_refresh = power_update_info(power);
@@ -677,11 +1009,6 @@ static void power_init_settings(Power* power) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     furi_pubsub_subscribe(storage_get_pubsub(storage), power_storage_callback, power);
 
-    if(storage_sd_status(storage) != FSE_OK) {
-        FURI_LOG_D(TAG, "SD Card not ready, skipping settings");
-        return;
-    }
-
     power_settings_load(&power->settings);
     power_settings_apply(power);
     furi_record_close(RECORD_STORAGE);
@@ -689,7 +1016,7 @@ static void power_init_settings(Power* power) {
 }
 
 static Power* power_alloc(void) {
-    Power* power = malloc(sizeof(Power));
+    Power* power = calloc(1, sizeof(Power));
     // Pubsub
     power->event_pubsub = furi_pubsub_alloc();
     // State initialization
@@ -727,7 +1054,14 @@ static Power* power_alloc(void) {
     gui_add_view_port(gui, power->battery_view_port, GuiLayerStatusBarRight);
     // Event loop
     power->event_loop = furi_event_loop_alloc();
-    power->message_queue = furi_message_queue_alloc(4, sizeof(PowerMessage));
+    /* 8: room for the light-sleep wake message next to API requests. */
+    power->message_queue = furi_message_queue_alloc(8, sizeof(PowerMessage));
+
+    /* Leave light sleep on any input event and whenever the grant is revoked
+     * (display woken, app starting), independent of the tick period. */
+    power->light_sleep_input_subscription = furi_pubsub_subscribe(
+        power->input_events_pubsub, power_light_sleep_input_callback, power);
+    furi_hal_power_set_light_sleep_revoke_callback(power_light_sleep_revoke_callback, power);
 
     furi_event_loop_subscribe_message_queue(
         power->event_loop,

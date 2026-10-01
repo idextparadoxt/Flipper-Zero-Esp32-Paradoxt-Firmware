@@ -4,8 +4,10 @@
  */
 
 #include "furi_hal_display.h"
+#include "furi_hal_power.h"
 #include "boards/board.h"
 
+#include <furi.h>
 #include <string.h>
 #include <driver/gpio.h>
 #include <driver/i2c.h>
@@ -123,23 +125,61 @@ void furi_hal_display_set_backlight(uint8_t brightness) {
 }
 
 static bool panel_is_asleep = false;
+static uint32_t panel_sleep_transition_count = 0;
 
 void furi_hal_display_sleep(void) {
-    if(!display_ready || panel_is_asleep) return;
+    if(!display_ready) return;
+    furi_hal_power_allow_light_sleep(false);
+    if(furi_hal_display_is_asleep()) return;
     const uint8_t command = 0xAE; /* display off */
-    sh1106_commands(&command, 1);
-    panel_is_asleep = true;
+    if(sh1106_commands(&command, 1) == ESP_OK) {
+        FURI_CRITICAL_ENTER();
+        if(!panel_is_asleep) {
+            panel_is_asleep = true;
+            panel_sleep_transition_count++;
+        }
+        FURI_CRITICAL_EXIT();
+    }
+}
+
+static FuriHalDisplayWakeCallback display_wake_callback = NULL;
+static void* display_wake_context = NULL;
+
+void furi_hal_display_set_wake_callback(FuriHalDisplayWakeCallback callback, void* context) {
+    FURI_CRITICAL_ENTER();
+    display_wake_callback = callback;
+    display_wake_context = context;
+    FURI_CRITICAL_EXIT();
 }
 
 void furi_hal_display_wakeup(void) {
-    if(!display_ready || !panel_is_asleep) return;
+    if(!display_ready) return;
+    furi_hal_power_allow_light_sleep(false);
+    if(!furi_hal_display_is_asleep()) return;
     const uint8_t command = 0xAF; /* display on */
-    sh1106_commands(&command, 1);
-    panel_is_asleep = false;
+    if(sh1106_commands(&command, 1) == ESP_OK) {
+        FURI_CRITICAL_ENTER();
+        if(panel_is_asleep) {
+            panel_is_asleep = false;
+            panel_sleep_transition_count++;
+        }
+        FuriHalDisplayWakeCallback callback = display_wake_callback;
+        void* context = display_wake_context;
+        FURI_CRITICAL_EXIT();
+        if(callback) callback(context);
+    }
 }
 
 bool furi_hal_display_is_asleep(void) {
-    return panel_is_asleep;
+    return furi_hal_display_get_sleep_state(NULL);
+}
+
+bool furi_hal_display_get_sleep_state(uint32_t* transition_count) {
+    FURI_CRITICAL_ENTER();
+    const bool is_asleep = panel_is_asleep;
+    if(transition_count) *transition_count = panel_sleep_transition_count;
+    FURI_CRITICAL_EXIT();
+    return is_asleep;
 }
 
 uint16_t furi_hal_display_get_h_res(void) {

@@ -90,6 +90,7 @@ typedef enum {
     /* Host hat die qFlipper-Verbindung beendet (Auto-off der Bridge): Bridge
      * stoppen + Composite abbauen → zurueck zu USB-Serial-JTAG. */
     DesktopGlobalQflipperStop,
+    DesktopGlobalSystemTaskFinished,
 
     DesktopAnimationEventCheckAnimation,
     DesktopAnimationEventNewIdleAnimation,
@@ -109,4 +110,6 @@ typedef enum {
     DesktopGlobalApiUnlock,
     DesktopGlobalSaveSettings,
     DesktopGlobalReloadSettings,
+    DesktopGlobalIdleEnter,
+    DesktopGlobalIdleExit,
 } DesktopEvent;

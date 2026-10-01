@@ -31,7 +31,14 @@ struct BubbleAnimationView {
     FuriTimer* timer;
     BubbleAnimationInteractCallback interact_callback;
     void* interact_callback_context;
+    volatile bool paused; /* device idle: no frame timer */
+    bool active; /* between enter and exit callbacks */
 };
+
+/* Every frame-timer start goes through here so a paused view stays quiet. */
+static void bubble_animation_timer_start(BubbleAnimationView* view, uint32_t period) {
+    if(!view->paused) furi_timer_start(view->timer, period);
+}
 
 static void bubble_animation_activate(BubbleAnimationView* view, bool force);
 static void bubble_animation_activate_right_now(BubbleAnimationView* view);
@@ -196,7 +203,7 @@ static void bubble_animation_activate_right_now(BubbleAnimationView* view) {
     view_commit_model(view->view, true);
 
     if(frame_rate) {
-        furi_timer_start(view->timer, 1000 / frame_rate);
+        bubble_animation_timer_start(view, 1000 / frame_rate);
     }
 }
 
@@ -291,6 +298,7 @@ static void bubble_animation_release_frame(Icon** icon) {
 static void bubble_animation_enter(void* context) {
     furi_assert(context);
     BubbleAnimationView* view = context;
+    view->active = true;
     bubble_animation_activate(view, false);
 
     BubbleAnimationViewModel* model = view_get_model(view->view);
@@ -301,13 +309,14 @@ static void bubble_animation_enter(void* context) {
     view_commit_model(view->view, false);
 
     if(frame_rate) {
-        furi_timer_start(view->timer, 1000 / frame_rate);
+        bubble_animation_timer_start(view, 1000 / frame_rate);
     }
 }
 
 static void bubble_animation_exit(void* context) {
     furi_assert(context);
     BubbleAnimationView* view = context;
+    view->active = false;
     furi_timer_stop(view->timer);
 }
 
@@ -376,7 +385,7 @@ void bubble_animation_view_set_animation(
     model->active_cycle = 0;
     view_commit_model(view->view, true);
 
-    furi_timer_start(view->timer, 1000 / new_animation->icon_animation.frame_rate);
+    bubble_animation_timer_start(view, 1000 / new_animation->icon_animation.frame_rate);
 }
 
 void bubble_animation_freeze(BubbleAnimationView* view) {
@@ -402,8 +411,25 @@ void bubble_animation_unfreeze(BubbleAnimationView* view) {
     frame_rate = model->current->icon_animation.frame_rate;
     view_commit_model(view->view, true);
 
-    furi_timer_start(view->timer, 1000 / frame_rate);
+    bubble_animation_timer_start(view, 1000 / frame_rate);
     bubble_animation_activate(view, false);
+}
+
+void bubble_animation_set_paused(BubbleAnimationView* view, bool paused) {
+    furi_assert(view);
+    view->paused = paused;
+    if(paused) {
+        furi_timer_stop(view->timer);
+        return;
+    }
+    if(!view->active) return;
+    uint8_t frame_rate = 0;
+    BubbleAnimationViewModel* model = view_get_model(view->view);
+    if(model->current && !model->freeze_frame) {
+        frame_rate = model->current->icon_animation.frame_rate;
+    }
+    view_commit_model(view->view, false);
+    if(frame_rate) bubble_animation_timer_start(view, 1000 / frame_rate);
 }
 
 View* bubble_animation_get_view(BubbleAnimationView* view) {

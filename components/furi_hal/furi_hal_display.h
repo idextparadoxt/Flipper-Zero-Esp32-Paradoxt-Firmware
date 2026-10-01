@@ -50,9 +50,17 @@ void furi_hal_display_sleep(void);
  */
 void furi_hal_display_wakeup(void);
 
+/** Called (from the waking thread) after the panel left sleep. The GUI uses it
+ * to request a redraw: frames are not sent while the panel sleeps, so the first
+ * frame after waking must be produced again. The callback must not block. */
+typedef void (*FuriHalDisplayWakeCallback)(void* context);
+void furi_hal_display_set_wake_callback(FuriHalDisplayWakeCallback callback, void* context);
+
 /** True if the panel is currently in display-off/sleep (i.e. the screen has
  * timed out). Used to gate idle light sleep on "screen is off". */
 bool furi_hal_display_is_asleep(void);
+/** Atomically read sleep state and the transition counter used to detect brief wake cycles. */
+bool furi_hal_display_get_sleep_state(uint32_t* transition_count);
 
 /** Set the UI foreground color (the tint that fills the "ink" of every
  * monochrome u8g2 frame on this color port). Stored as RGB565, byte-swapped
@@ -89,6 +97,21 @@ uint16_t furi_hal_display_get_v_res(void);
  * its 128x64 framebuffer, so callers that do not pause the GUI will flicker.
  */
 esp_lcd_panel_handle_t furi_hal_display_get_panel_handle(void);
+
+/** Draw an RGB565 (byte-swapped) rectangle straight to the panel and wait for
+ * the DMA transfer to finish, so `data` may be reused as soon as this returns.
+ *
+ * For full-screen takeover apps holding gui_direct_draw_acquire(). Takes the
+ * shared SPI bus lock internally. `data` must be in DMA-capable memory.
+ * x1/y1 are exclusive, as in esp_lcd_panel_draw_bitmap().
+ */
+void furi_hal_display_blit(int x0, int y0, int x1, int y1, const void* data);
+
+/** Forget what the HAL believes is on the panel, so the next commit repaints
+ * the whole screen (margins included) instead of being skipped by the
+ * frame-diff check. Call after drawing to the panel directly.
+ */
+void furi_hal_display_invalidate(void);
 
 #ifdef __cplusplus
 }

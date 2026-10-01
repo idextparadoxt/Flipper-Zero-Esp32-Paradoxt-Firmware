@@ -87,3 +87,7 @@ void bubble_animation_freeze(BubbleAnimationView* view);
  * @view        bubble animation view instance
  */
 void bubble_animation_unfreeze(BubbleAnimationView* view);
+
+/** Stop (paused=true) or resume the frame timer, e.g. while the device is idle
+ * with the screen off. Does not change the animation state. */
+void bubble_animation_set_paused(BubbleAnimationView* view, bool paused);

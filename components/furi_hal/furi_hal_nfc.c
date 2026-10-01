@@ -269,11 +269,19 @@ static FuriHalNfcError pn532_read_response(uint8_t* response, size_t* response_l
     return FuriHalNfcErrorNone;
 }
 
+/* PN532 soft power-down (PowerDown 0x16): 22 uA typ instead of the several mA
+ * the chip draws idling in normal mode (NXP PN532 C1 data sheet). Entered when
+ * no NFC session is open, left lazily by the next command. */
+#ifndef BOARD_NFC_PN532_POWERDOWN
+#define BOARD_NFC_PN532_POWERDOWN 1
+#endif
+static volatile bool pn532_powered_down = false;
+
 /**
  * Send a PN532 command and receive the response.
  * Handles: I2C write → wait ACK → read ACK → wait response → read response.
  */
-static FuriHalNfcError pn532_send_command(
+static FuriHalNfcError pn532_send_command_raw(
     const uint8_t* cmd,
     size_t cmd_len,
     uint8_t* response,
@@ -339,6 +347,57 @@ static FuriHalNfcError pn532_send_command(
     }
 
     return pn532_read_response(response, response_len, response_len ? *response_len : 0);
+}
+
+/* Leave PowerDown. Over I2C the PN532 wakes on its own address and stretches
+ * SCL while its oscillator starts; the first frame can still be lost, hence
+ * the retries. SAMConfiguration(normal) is what returns it to normal mode
+ * (libnfc pn532_i2c.c, PN532 application note C106). */
+static FuriHalNfcError pn532_wake_up(void) {
+    uint8_t sam_cmd[] = {PN532_CMD_SAMCONFIGURATION, 0x01, 0x14, 0x01};
+    FuriHalNfcError err = FuriHalNfcErrorCommunication;
+    for(uint8_t attempt = 0; attempt < 3; attempt++) {
+        err = pn532_send_command_raw(sam_cmd, sizeof(sam_cmd), NULL, NULL, 1000);
+        if(err == FuriHalNfcErrorNone) {
+            pn532_powered_down = false;
+            return FuriHalNfcErrorNone;
+        }
+        furi_delay_ms(5);
+    }
+    FURI_LOG_E(TAG, "PN532 wake-up from power-down failed");
+    return err;
+}
+
+static FuriHalNfcError pn532_send_command(
+    const uint8_t* cmd,
+    size_t cmd_len,
+    uint8_t* response,
+    size_t* response_len,
+    uint32_t timeout_ms) {
+    if(pn532_powered_down) {
+        FuriHalNfcError err = pn532_wake_up();
+        if(err != FuriHalNfcErrorNone) return err;
+    }
+    return pn532_send_command_raw(cmd, cmd_len, response, response_len, timeout_ms);
+}
+
+/* Caller owns the bus (nfc_mutex or single-threaded init). */
+static void pn532_power_down(void) {
+#if BOARD_NFC_PN532_POWERDOWN
+    if(!nfc_hal_ready || pn532_powered_down) return;
+    /* WakeUpEnable 0xF0 = I2C | GPIO | SPI | HSU, as libnfc pn53x_PowerDown(). */
+    uint8_t cmd[] = {PN532_CMD_POWERDOWN, 0xF0};
+    uint8_t status = 0xFF;
+    size_t status_len = sizeof(status);
+    const FuriHalNfcError err = pn532_send_command_raw(cmd, sizeof(cmd), &status, &status_len, 500);
+    if(err == FuriHalNfcErrorNone && status_len >= 1 && (status & 0x3F) == 0x00) {
+        pn532_powered_down = true;
+        pn532_target_number = 0;
+        FURI_LOG_D(TAG, "PN532 in power-down");
+    } else {
+        FURI_LOG_W(TAG, "PN532 PowerDown not confirmed (err=%d status=0x%02X)", err, status);
+    }
+#endif
 }
 
 /** Convert PN532 InCommunicateThru/InDataExchange status byte to HAL error */
@@ -425,6 +484,8 @@ FuriHalNfcError furi_hal_nfc_init(void) {
     nfc_hal_ready = true;
     pn532_target_number = 0;
     FURI_LOG_I(TAG, "NFC HAL initialized");
+    /* Nothing uses the reader until an NFC session acquires it. */
+    pn532_power_down();
     return FuriHalNfcErrorNone;
 }
 
@@ -439,8 +500,18 @@ FuriHalNfcError furi_hal_nfc_acquire(void) {
 }
 
 FuriHalNfcError furi_hal_nfc_release(void) {
+    /* Session over: park the reader before giving the bus back. */
+    pn532_power_down();
     furi_check(furi_mutex_release(nfc_mutex) == FuriStatusOk);
     return FuriHalNfcErrorNone;
+}
+
+void furi_hal_nfc_power_down(void) {
+    if(!nfc_hal_ready || !nfc_mutex) return;
+    /* Skipped while an NFC session owns the reader. */
+    if(furi_mutex_acquire(nfc_mutex, 100) != FuriStatusOk) return;
+    pn532_power_down();
+    furi_mutex_release(nfc_mutex);
 }
 
 FuriHalNfcError furi_hal_nfc_low_power_mode_start(void) {
@@ -1891,6 +1962,7 @@ FuriHalNfcError furi_hal_nfc_init(void) {
 FuriHalNfcError furi_hal_nfc_is_hal_ready(void) { return FuriHalNfcErrorCommunication; }
 FuriHalNfcError furi_hal_nfc_acquire(void) { return FuriHalNfcErrorCommunication; }
 FuriHalNfcError furi_hal_nfc_release(void) { return FuriHalNfcErrorNone; }
+void furi_hal_nfc_power_down(void) {}
 FuriHalNfcError furi_hal_nfc_low_power_mode_start(void) { return FuriHalNfcErrorNone; }
 FuriHalNfcError furi_hal_nfc_low_power_mode_stop(void) { return FuriHalNfcErrorNone; }
 
