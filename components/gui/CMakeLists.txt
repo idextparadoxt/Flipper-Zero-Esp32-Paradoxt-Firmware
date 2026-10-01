@@ -33,6 +33,7 @@ idf_component_register(
         "modules/widget_elements/widget_element_circle.c"
         "modules/widget_elements/widget_element_icon.c"
         "modules/widget_elements/widget_element_line.c"
+        "modules/widget_elements/widget_element_marquee_header.c"
         "modules/widget_elements/widget_element_rect.c"
         "modules/widget_elements/widget_element_string.c"
         "modules/widget_elements/widget_element_string_multiline.c"

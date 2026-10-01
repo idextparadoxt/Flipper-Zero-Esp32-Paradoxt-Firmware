@@ -21,6 +21,12 @@ extern "C" {
  * view_port.c), so touch is treated like HARDWARE everywhere except that one
  * encoder-specific remap. */
 #define INPUT_SEQUENCE_SOURCE_TOUCH    (2u)
+/* A hardware button click that started while the display was off. The input
+ * service tags every event of that click (press, repeats, release and any
+ * synthetic short) with this source: the notification service still treats it
+ * as user activity and wakes the screen, but the GUI drops it so the click only
+ * wakes the screen and is not delivered to the running app. */
+#define INPUT_SEQUENCE_SOURCE_HARDWARE_WAKE (3u)
 
 /** Input Keys */
 typedef enum {

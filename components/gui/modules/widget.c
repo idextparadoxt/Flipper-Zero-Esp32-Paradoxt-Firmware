@@ -148,6 +148,26 @@ void widget_add_string_element(
     widget_add_element(widget, string_element);
 }
 
+void widget_add_marquee_header_element(
+    Widget* widget,
+    uint8_t x,
+    uint8_t y,
+    uint8_t right_x,
+    Font title_font,
+    const char* title,
+    Font right_font,
+    const char* right_text) {
+    furi_check(widget);
+    WidgetElement* marquee_element = widget_element_marquee_header_create(
+        x, y, right_x, title_font, title, right_font, right_text);
+    widget_add_element(widget, marquee_element);
+}
+
+void widget_redraw(Widget* widget) {
+    furi_check(widget);
+    with_view_model(widget->view, GuiWidgetModel * model, { UNUSED(model); }, true);
+}
+
 void widget_add_text_box_element(
     Widget* widget,
     uint8_t x,

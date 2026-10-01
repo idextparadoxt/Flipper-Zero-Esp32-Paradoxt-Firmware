@@ -6,6 +6,7 @@
 #include <furi.h>
 #include <furi_hal_display.h>
 #include <furi_hal_light.h>
+#include <furi_hal_power.h>
 #include <furi_hal_rtc.h>
 #include <furi_hal_speaker.h>
 #include <esp_random.h>
@@ -27,12 +28,15 @@ typedef enum {
     NotificationLayerMessage,
     InternalLayerMessage,
     SaveSettingsMessage,
+    SoundToneMessage,
 } NotificationAppMessageType;
 
 typedef struct {
     const NotificationSequence* sequence;
     NotificationAppMessageType type;
     FuriEventFlag* back_event;
+    float tone_frequency;
+    float tone_volume;
 } NotificationAppMessage;
 
 static bool lcd_backlight_is_on = false;
@@ -296,11 +300,40 @@ static void notification_process_internal_message(
     }
 }
 
+static void notification_process_tone_message(
+    NotificationApp* app,
+    const NotificationAppMessage* message) {
+    const bool tone_requested = message->tone_frequency > 0.0f && message->tone_volume > 0.0f;
+    const bool audible = tone_requested && app->settings.speaker_volume > 0.0f &&
+                         !furi_hal_rtc_is_flag_set(FuriHalRtcFlagStealthMode);
+
+    if(audible) {
+        if(furi_hal_speaker_is_mine() || furi_hal_speaker_acquire(30)) {
+            furi_hal_speaker_start(
+                message->tone_frequency, message->tone_volume * app->settings.speaker_volume);
+        }
+    } else if(furi_hal_speaker_is_mine()) {
+        furi_hal_speaker_stop();
+        furi_hal_speaker_release();
+    }
+}
+
 static void input_event_callback(const void* value, void* context) {
     furi_assert(value);
     furi_assert(context);
 
     NotificationApp* app = context;
+    const InputEvent* event = value;
+    if(event->type == InputTypePress &&
+       (event->sequence_source == INPUT_SEQUENCE_SOURCE_HARDWARE ||
+        event->sequence_source == INPUT_SEQUENCE_SOURCE_HARDWARE_WAKE)) {
+        if(furi_hal_display_is_asleep()) {
+            notification_set_led_sleeping(app, false);
+        }
+        notification_message(
+            app,
+            furi_hal_display_is_asleep() ? &sequence_wakeup : &sequence_button_click);
+    }
     notification_message(app, &sequence_display_backlight_on);
     /* Keep the WS2812 ring alive on user input. If the idle-off timer already
      * darkened it, re-light fully (resets phase + restarts the effect). If it's
@@ -549,6 +582,7 @@ static void render_wipe(NotificationApp* app) {
 static void notification_led_effect_tick(void* context) {
     furi_assert(context);
     NotificationApp* app = context;
+    if(app->led_sleep_suspended) return;
     led_effect_phase++;
     switch(app->settings.led_effect) {
         case LedEffectBreathing: render_breathing(app); break;
@@ -567,6 +601,12 @@ static void notification_led_effect_tick(void* context) {
  * Also (re)starts the idle-off timer. */
 void notification_apply_led_color(NotificationApp* app) {
     if(!app) return;
+    if(app->led_sleep_suspended) {
+        if(app->led_effect_timer && furi_timer_is_running(app->led_effect_timer)) {
+            furi_timer_stop(app->led_effect_timer);
+        }
+        return;
+    }
     /* About to re-light the ring — clear the idle-off marker. */
     app->led_idle_off = false;
     /* Always stop the effect timer; we'll restart for animated effects. */
@@ -609,6 +649,20 @@ void notification_apply_led_color(NotificationApp* app) {
         } else if(furi_timer_is_running(app->led_off_timer)) {
             furi_timer_stop(app->led_off_timer);
         }
+    }
+}
+
+void notification_set_led_sleeping(NotificationApp* app, bool sleeping) {
+    if(!app || app->led_sleep_suspended == sleeping) return;
+    app->led_sleep_suspended = sleeping;
+    if(sleeping) {
+        if(app->led_effect_timer && furi_timer_is_running(app->led_effect_timer)) {
+            furi_timer_stop(app->led_effect_timer);
+        }
+        furi_hal_light_set_ws2812_sleep(true);
+    } else {
+        furi_hal_light_set_ws2812_sleep(false);
+        notification_apply_led_color(app);
     }
 }
 
@@ -721,6 +775,27 @@ void notification_apply_ui_color(NotificationApp* app) {
     }
 }
 
+/* Light-sleep idle: the night-shift clock check (1 s) and the Spectrum UI
+ * colour cycle (50 ms, redraws the screen) are pointless with the screen off.
+ * Runs in the power service thread; furi timers are safe to drive from here. */
+static bool notification_ui_spectrum_paused = false;
+
+static void notification_power_idle_callback(const void* message, void* context) {
+    const FuriHalPowerIdleEvent* event = message;
+    NotificationApp* app = context;
+    if(event->idle) {
+        night_shift_timer_stop(app);
+        notification_ui_spectrum_paused = furi_timer_is_running(app->ui_spectrum_timer);
+        if(notification_ui_spectrum_paused) furi_timer_stop(app->ui_spectrum_timer);
+    } else {
+        night_shift_timer_start(app); /* only runs when night shift is enabled */
+        if(notification_ui_spectrum_paused) {
+            notification_ui_spectrum_paused = false;
+            furi_timer_start(app->ui_spectrum_timer, furi_ms_to_ticks(UI_COLOR_TICK_MS));
+        }
+    }
+}
+
 static NotificationApp* notification_app_alloc(void) {
     NotificationApp* app = malloc(sizeof(NotificationApp));
 
@@ -765,6 +840,7 @@ static NotificationApp* notification_app_alloc(void) {
     app->display.value[LayerNotification] = 0x00;
     app->display.index = LayerInternal;
     app->display_led_lock = false;
+    app->led_sleep_suspended = false;
 
     app->event_record = furi_record_open(RECORD_INPUT_EVENTS);
     furi_pubsub_subscribe(app->event_record, input_event_callback, app);
@@ -787,6 +863,9 @@ int32_t notification_srv(void* p) {
     notification_apply_internal_display_layer(app, 0x00);
 
     furi_record_create(RECORD_NOTIFICATION, app);
+
+    FuriPubSub* idle_pubsub = furi_hal_power_get_idle_pubsub();
+    if(idle_pubsub) furi_pubsub_subscribe(idle_pubsub, notification_power_idle_callback, app);
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     for(int i = 0; i < 50 && storage_sd_status(storage) != FSE_OK; i++) {
@@ -819,6 +898,9 @@ int32_t notification_srv(void* p) {
         case SaveSettingsMessage:
             notification_save_settings(app);
             break;
+        case SoundToneMessage:
+            notification_process_tone_message(app, &message);
+            break;
         }
 
         if(message.back_event != NULL) {
@@ -831,6 +913,18 @@ int32_t notification_srv(void* p) {
 
 void notification_message(NotificationApp* app, const NotificationSequence* sequence) {
     notification_message_send(app, NotificationLayerMessage, sequence, NULL);
+}
+
+void notification_message_tone(NotificationApp* app, float frequency, float volume) {
+    furi_assert(app);
+    NotificationAppMessage message = {
+        .sequence = NULL,
+        .type = SoundToneMessage,
+        .back_event = NULL,
+        .tone_frequency = frequency,
+        .tone_volume = volume,
+    };
+    furi_check(furi_message_queue_put(app->queue, &message, FuriWaitForever) == FuriStatusOk);
 }
 
 void notification_message_block(NotificationApp* app, const NotificationSequence* sequence) {

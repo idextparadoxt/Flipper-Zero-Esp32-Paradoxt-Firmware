@@ -15,6 +15,7 @@
 
 #define TAG "Input"
 #define INPUT_POLL_MS 4U
+#define INPUT_IDLE_POLL_MS 20U
 
 const char* input_get_key_name(InputKey key) {
     switch(key) {
@@ -52,11 +53,67 @@ const char* input_get_type_name(InputType type) {
     }
 }
 
+/* Targets without interrupt-capable inputs keep polling. */
+__attribute__((weak)) bool target_input_idle_wait(uint32_t timeout_ms) {
+    UNUSED(timeout_ms);
+    return false;
+}
+
+/* Wake-click filter. Drivers publish into a private pubsub; this filter
+ * forwards to the public RECORD_INPUT_EVENTS one. A click whose press arrives
+ * while the display is off is only meant to wake the screen, so all its events
+ * are re-tagged INPUT_SEQUENCE_SOURCE_HARDWARE_WAKE (see input.h).
+ *
+ * The display state is sampled once before each driver poll, i.e. before any
+ * subscriber (notification) can wake the panel in reaction to the press, so the
+ * decision cannot race with the wake-up itself. A click ends at its Release,
+ * but some drivers (paradoxt) emit a synthetic Press/Short/Release right after
+ * the real Release within the same poll; those are covered by keeping the
+ * swallow state until the poll that delivered the Release is over. */
+typedef struct {
+    FuriPubSub* output;
+    bool poll_display_asleep;
+    bool swallow[InputKeyMAX];
+    bool release_seen[InputKeyMAX];
+} InputWakeFilter;
+
+static void input_wake_filter_callback(const void* value, void* context) {
+    InputWakeFilter* filter = context;
+    InputEvent event = *(const InputEvent*)value;
+
+    if(event.sequence_source == INPUT_SEQUENCE_SOURCE_HARDWARE && event.key < InputKeyMAX) {
+        if(event.type == InputTypePress && !filter->swallow[event.key] &&
+           filter->poll_display_asleep) {
+            filter->swallow[event.key] = true;
+            filter->release_seen[event.key] = false;
+        }
+        if(filter->swallow[event.key]) {
+            event.sequence_source = INPUT_SEQUENCE_SOURCE_HARDWARE_WAKE;
+            if(event.type == InputTypeRelease) filter->release_seen[event.key] = true;
+        }
+    }
+
+    furi_pubsub_publish(filter->output, &event);
+}
+
+static void input_wake_filter_poll_done(InputWakeFilter* filter) {
+    for(size_t i = 0; i < InputKeyMAX; i++) {
+        if(filter->release_seen[i]) {
+            filter->swallow[i] = false;
+            filter->release_seen[i] = false;
+        }
+    }
+}
+
 int32_t input_srv(void* p) {
     UNUSED(p);
 
     FuriPubSub* event_pubsub = furi_pubsub_alloc();
     furi_record_create(RECORD_INPUT_EVENTS, event_pubsub);
+
+    FuriPubSub* driver_pubsub = furi_pubsub_alloc();
+    InputWakeFilter wake_filter = {.output = event_pubsub};
+    furi_pubsub_subscribe(driver_pubsub, input_wake_filter_callback, &wake_filter);
 
     target_input_init();
 
@@ -68,12 +125,22 @@ int32_t input_srv(void* p) {
 #endif
 
     while(true) {
-        /* Permit light sleep only while the screen is off and on battery;
-         * re-checked each poll so plugging USB closes the gate promptly. */
-        furi_hal_power_allow_light_sleep(
-            furi_hal_display_is_asleep() && furi_hal_power_is_running_on_battery());
-        furi_delay_ms(INPUT_POLL_MS);
-        target_input_poll(event_pubsub, &sequence_counter);
+        const bool display_asleep = furi_hal_display_is_asleep();
+        /* No charger I2C access here: in light sleep VBUS is never polled (the
+         * power service caches it before granting sleep), and while awake the
+         * power service refreshes it once per second. */
+        if(display_asleep && furi_hal_power_is_light_sleep_active()) {
+            /* Light sleep granted: sleep until a button pin wakes the SoC
+             * instead of waking it every INPUT_IDLE_POLL_MS. */
+            if(!target_input_idle_wait(FuriWaitForever)) {
+                furi_delay_ms(INPUT_IDLE_POLL_MS);
+            }
+        } else {
+            furi_delay_ms(display_asleep ? INPUT_IDLE_POLL_MS : INPUT_POLL_MS);
+        }
+        wake_filter.poll_display_asleep = furi_hal_display_is_asleep();
+        target_input_poll(driver_pubsub, &sequence_counter);
+        input_wake_filter_poll_done(&wake_filter);
 
 #if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
         /* Debug telemetry: log light-sleep engagement every 5s. Counters persist

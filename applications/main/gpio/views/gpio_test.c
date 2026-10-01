@@ -2,6 +2,7 @@
 #include "../gpio_items.h"
 
 #include <gui/elements.h>
+#include <boards/board.h>
 
 struct GpioTest {
     View* view;
@@ -119,7 +120,15 @@ GpioTest* gpio_test_alloc(GPIOItems* gpio_items) {
     view_set_context(gpio_test->view, gpio_test);
     view_set_draw_callback(gpio_test->view, gpio_test_draw_callback);
     view_set_input_callback(gpio_test->view, gpio_test_input_callback);
+#if defined(BOARD_HAS_ENCODER) && BOARD_HAS_ENCODER
+    /* One-axis rotary encoder: only Up/Down exist, so ask the dispatcher to
+     * remap them to Left/Right. */
     view_set_input_mode(gpio_test->view, ViewInputModeLeftRight);
+#else
+    /* Real 4-way pad: LeftRight mode would swap Up<->Left and Down<->Right and
+     * the pin would change on Up/Down. Keep the physical Left/Right keys. */
+    view_set_input_mode(gpio_test->view, ViewInputModeUpDown);
+#endif
 
     return gpio_test;
 }

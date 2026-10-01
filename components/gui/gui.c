@@ -1,5 +1,6 @@
 #include "gui_i.h"
 #include <assets_icons.h>
+#include <furi_hal_display.h>
 
 #define TAG "GuiSrv"
 
@@ -47,6 +48,10 @@ void gui_input_events_callback(const void* value, void* ctx) {
     furi_assert(ctx);
 
     Gui* gui = ctx;
+    const InputEvent* event = value;
+
+    /* Click that only woke the screen: the app must not see it. */
+    if(event->sequence_source == INPUT_SEQUENCE_SOURCE_HARDWARE_WAKE) return;
 
     furi_message_queue_put(gui->input_queue, value, FuriWaitForever);
     furi_thread_flags_set(gui->thread_id, GUI_THREAD_FLAG_INPUT);
@@ -546,6 +551,10 @@ Canvas* gui_direct_draw_acquire(Gui* gui) {
 void gui_direct_draw_release(Gui* gui) {
     furi_check(gui);
 
+    // The direct-draw owner may have painted the whole panel (margins too)
+    // behind the display HAL's back; make the next commits repaint everything
+    // instead of being skipped by the HAL's frame-diff cache.
+    furi_hal_display_invalidate();
     canvas_reset(gui->canvas);
     canvas_commit(gui->canvas);
 
@@ -554,6 +563,11 @@ void gui_direct_draw_release(Gui* gui) {
     gui_unlock(gui);
 
     gui_update(gui);
+}
+
+/* Display HAL drops frames while the panel sleeps; redraw once it is awake. */
+static void gui_display_wake_callback(void* context) {
+    gui_update(context);
 }
 
 Gui* gui_alloc(void) {
@@ -576,6 +590,8 @@ Gui* gui_alloc(void) {
     gui->input_events = furi_record_open(RECORD_INPUT_EVENTS);
 
     furi_pubsub_subscribe(gui->input_events, gui_input_events_callback, gui);
+
+    furi_hal_display_set_wake_callback(gui_display_wake_callback, gui);
 
     return gui;
 }

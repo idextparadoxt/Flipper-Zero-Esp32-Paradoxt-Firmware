@@ -105,6 +105,39 @@ void widget_add_text_box_element(
     const char* text,
     bool strip_to_dots);
 
+/** Add Marquee Header Element
+ *
+ * One header line: `title` starts at x, `right_text` is right-aligned at
+ * right_x and always fully visible. A title too long for the space left
+ * between them scrolls instead of overlapping `right_text`. The scroll position
+ * follows the system tick; call widget_redraw() periodically (e.g. from the
+ * scene tick event) to animate it.
+ *
+ * @param      widget       Widget instance
+ * @param      x            x coordinate of the title
+ * @param      y            baseline y coordinate of both texts
+ * @param      right_x      x coordinate of the right edge of right_text
+ * @param      title_font   Font of the title
+ * @param      title        Title text (e.g. SSID)
+ * @param      right_font   Font of right_text
+ * @param      right_text   Fixed text on the right (e.g. "-60 dBm")
+ */
+void widget_add_marquee_header_element(
+    Widget* widget,
+    uint8_t x,
+    uint8_t y,
+    uint8_t right_x,
+    Font title_font,
+    const char* title,
+    Font right_font,
+    const char* right_text);
+
+/** Request a redraw of the widget (for animated elements)
+ *
+ * @param      widget  Widget instance
+ */
+void widget_redraw(Widget* widget);
+
 /** Add Text Scroll Element
  *
  * @param      widget           Widget instance
